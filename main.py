@@ -123,7 +123,7 @@ class FTPSHandler:
             self.ftps.delete(remote_path)
             print(f"Deleted: {remote_path} at {time.ctime()}")
         except (error_perm, error_temp) as e:
-            print(f"Cannot delete {remote_path}: {e}.")
+            print(f"{e}.")
         except Exception as e:
             retry = ERR_OTHER not in self.errors
             print(f"Failed to delete {remote_path}: {e}."
@@ -151,8 +151,30 @@ class FTPSHandler:
         try:
             # get listing with type (file or dir or ??)
             listing = self.ftps.mlsd(path, facts=['type'])
+
+            for (item, fact) in listing:
+                if item in ['.', '..']:
+                    continue
+                full_path = f"{path}/{item}"
+                if fact['type'] == 'dir':
+                    # Recursively delete subdirectory
+                    self.do_delete_dir(full_path)
+                elif fact['type'] == 'file':
+                    try:
+                        self.ftps.delete(full_path)
+                        print(f'Deleted: {full_path}')
+                    except Exception as e:
+                        print(f"{e}.")
+
+            # Delete the now (hopefully) empty directory
+            try:
+                self.ftps.rmd(path)
+                print(f'Removed: {path}')
+            except Exception as e:
+                print(f"{e}.")
+
         except (error_perm, error_temp) as e:
-            print(f"Listing of {path} failed: {e}.")
+            print(f"{path} does not seem to exist on server.")
             return
         except Exception as e:
             retry = ERR_OTHER not in self.errors
@@ -165,27 +187,6 @@ class FTPSHandler:
                 self.do_delete_dir(path)
             self.errors.discard(ERR_OTHER)
             return
-
-        for (item, fact) in listing:
-            if item in ['.', '..']:
-                continue
-            full_path = f"{path}/{item}"
-            if fact['type'] == 'dir':
-                # Recursively delete subdirectory
-                self.do_delete_dir(full_path)
-            elif fact['type'] == 'file':
-                try:
-                    self.ftps.delete(full_path)
-                    print(f'Deleted: {full_path}')
-                except Exception as e:
-                    print(f"Could not delete {full_path}. {e}")
-
-        try:
-            # Delete the now empty (hopefully) directory
-            self.ftps.rmd(path)
-            print(f'Removed: {path}')
-        except Exception as e:
-            print(f"Could not remove {path}: {e}")
 
     def makedir(self, remote_dir):
         self.ftps.cwd(self.remote_dir)
