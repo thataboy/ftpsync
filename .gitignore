@@ -1,0 +1,6 @@
+*.zip
+*.7z
+**/.DS_STORE
+.DS_STORE
+*.ini
+__pycache__/
