@@ -7,9 +7,8 @@ import time
 import sys
 from queue import Queue, Empty
 from threading import Thread, Event
-from constants import ENCRYPT_PASSWORD, REQUIRED_VALUES, ROOT_PROFILE
 from crypty import decrypt
-from config_loader import load_config
+from config_loader import load_config, ENCRYPT_PASSWORD, REQUIRED_VALUES
 
 from enum import Enum
 
@@ -305,12 +304,19 @@ def clean_up(observers, queue_handlers):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(f"USAGE: {os.path.basename(__file__)} profile_name1 profile_name2 ...")
-        print(f"   or  {os.path.basename(__file__)} all")
+        script = os.path.basename(__file__)
+        print("USAGE:")
+        print(f"       {script} profile_name1 profile_name2 ...")
+        print(f"   or  {script} all      to use all profiles")
+        print(f"   or  {script} ALL      to use all profiles, override disabled")
         exit()
 
     ini_path = os.path.join(os.path.dirname(__file__), 'ftpsync.ini')
     profiles = load_config(ini_path, sys.argv)
+
+    if len(profiles) == 0:
+        print('No valid profiles enabled. Nothing to do.')
+        exit()
 
     print()
     (observers, queue_handlers) = start_monitor(profiles)

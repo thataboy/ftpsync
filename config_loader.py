@@ -1,12 +1,34 @@
 from configobj import ConfigObj
 from crypty import encrypt
 import re
-from constants import ENCRYPT_PASSWORD, REQUIRED_VALUES, ROOT_PROFILE
 import os
 
 
+ENCRYPT_PASSWORD = True
+REQUIRED_VALUES = {
+    "host",
+    "user",
+    "pwd" if ENCRYPT_PASSWORD else "password",
+    "local", "remote"
+}
+
+
+def mark_wanted(config, wanted, found):
+    """mark sections given on command line"""
+    parent = config.parent
+    for sect in parent.sections:
+        section = parent[sect]
+        if sect in wanted:
+            section['wanted'] = 1
+            found.add(sect)
+        for subsect in section.sections:
+            mark_wanted(section[subsect], wanted, found)
+
+
 def cascade_values(config):
-    """Cascade values from parent sections to all child sections recursively."""
+    """Cascade values from parent sections to all child sections recursively.
+       if the corresponding values are missing in child section
+    """
     parent = config.parent
     for sect in parent.sections:
         section = parent[sect]
@@ -18,7 +40,9 @@ def cascade_values(config):
 
 
 def encrypt_passwords(config, dirty_in):
-    """walk through tree and encrypt plain passwords"""
+    """walk through tree and encrypt plain passwords
+       returns True if changes were made
+    """
     dirty = False or dirty_in
     if 'password' in config:
         config['pwd'] = encrypt(config['password'])
@@ -35,29 +59,34 @@ def encrypt_passwords(config, dirty_in):
     return dirty
 
 
-def gather_profiles(config, profiles, is_root=False):
-    """gather all sections and subsections into a flat unnested dict"""
-    if is_root:
-        scalars = config.scalars
-        # if the root settings have all the required values,
-        # create a profile for it named ROOT_PROFILE
-        if len(REQUIRED_VALUES.difference(scalars)) == 0:
-            profiles[ROOT_PROFILE] = {key:config[key] for key in scalars}
+def gather_profiles(config, take, profiles):
+    """gather all sections and subsections into a flat unnested dict profiles
+       take = all was specified on command line
+    """
     parent = config.parent
     for sect in parent.sections:
         section = parent[sect]
-        scalars = section.scalars
-        profiles[sect] = {key:section[key] for key in scalars}
+        if take == 'ALL' \
+           or section.get('wanted') \
+           or take == 'all' and not section.get('disabled'):
+            scalars = section.scalars
+            profiles[sect] = {key: section[key] for key in scalars}
         for subsect in section.sections:
-            gather_profiles(section[subsect], profiles)
+            gather_profiles(section[subsect], take, profiles)
 
 
-def lint_profile(name, profile):
+def lint_profile(name, profile, bad_regexes):
+    """does some basic validation
+       returns True if profile is valid
+       bad_regexes keep tracks of bad regexes to avoid duplicative warnings
+    """
     if profile.get('ignore_regex'):
         try:
             profile['ignore_regex'] = re.compile(profile['ignore_regex'])
         except Exception as e:
-            print(f"Warning: {name} has bad regex:\n     {profile['ignore_regex']}\n{e}. Ignoring")
+            if profile['ignore_regex'] not in bad_regexes:
+                bad_regexes.add(profile['ignore_regex'])
+                print(f"Warning: {name} has bad regex:\n     {profile['ignore_regex']}\n{e}. Ignoring")
             profile['ignore_regex'] = None
 
     missing = REQUIRED_VALUES.difference(profile.keys())
@@ -65,14 +94,14 @@ def lint_profile(name, profile):
         print(f'Warning: {name} is missing {missing}. Skipping.')
         return False
 
-    local = profile.get('local')
-    if local is not None:
-        if local.startswith('~'):
-            local = os.path.expanduser(local)
-            profile['local'] = local
-        if not os.path.isdir(local):
-            print(f'Warning: {name} has invalid local folder {local}. Skipping.')
-            return False
+    local = profile['local']
+    if local.startswith('~'):
+        local = os.path.expanduser(local)
+        profile['local'] = local
+    if not os.path.isdir(local):
+        print(f'Error: {name} has invalid local folder {local}. Skipping.')
+        return False
+
     return True
 
 
@@ -81,7 +110,7 @@ def load_config(file_path, argv):
     Args:
         file_path: The path to the INI file.
         argv: command line arguments
-    Returns: ConfigObj object
+    Returns: dict of valid, wqnted profiles
     Note: if ENCRYPT_PASSWORD: if True,
         change password=<value> to pwd=<encrypted value>
         and rewrite the ini file
@@ -89,19 +118,29 @@ def load_config(file_path, argv):
     config = ConfigObj(file_path, interpolation=False)
 
     if ENCRYPT_PASSWORD:
-        dirty = encrypt_passwords(config, False)
+        dirty = encrypt_passwords(config, dirty_in=False)
         if dirty:
             config.write()
+
+    take = argv[1] if (argv[1] in ['ALL', 'all'] and len(argv) == 2) else None
+    if not take:
+        wanted = set(argv[1:])
+        found = set()
+        mark_wanted(config, wanted, found)
+        wanted -= found
+        if len(wanted) > 0:
+            print(f'Warning: Unknown profile(s) {wanted}')
 
     cascade_values(config)
 
     profiles = {}
-    gather_profiles(config, profiles, is_root=True)
+    gather_profiles(config, take, profiles)
 
-    # get names of profiles from command line and filter out profiles not asked for
-    names = ([ROOT_PROFILE] + list(profiles.keys())) if argv[1] == 'all' else argv[1:]
-    profiles = {name: profiles[name] for name in names if profiles.get(name)}
+    bad_regexes = set()
+    profiles = {name: profile for name, profile in profiles.items()
+                if lint_profile(name, profile, bad_regexes)}
 
-    profiles = {name: profile for name, profile in profiles.items() if lint_profile(name, profile)}
+    # print(profiles.keys())
+    # exit()
 
     return profiles
