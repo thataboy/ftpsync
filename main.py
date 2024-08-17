@@ -7,8 +7,8 @@ import time
 import sys
 from queue import Queue, Empty
 from threading import Thread, Event
-import configparser
 from crypty import encrypt, decrypt
+from config_loader import load_config
 
 SYNC_FILE_DELETION = True
 SYNC_FOLDER_DELETION = True
@@ -290,43 +290,6 @@ def clean_up(observers, queue_handlers):
     print('Cleanup completed')
 
 
-def load_ini(file_path, encrypt_password=False):
-    """Loads config ini
-    Args:
-        file_path: The path to the INI file.
-        encrypt_password: if True,
-        change password=<value> to pwd=<encrypted value>
-        and rewrite the ini file
-    Returns: Configparser object
-    """
-    config = configparser.ConfigParser(interpolation=None)
-    config.read(file_path)
-
-    if not encrypt_password:
-        return config
-
-    dirty = False
-
-    if config.has_option('DEFAULT', 'password'):
-        config.set('DEFAULT', 'pwd', encrypt(config.get('DEFAULT', 'password')))
-        config.remove_option('DEFAULT', 'password')
-        dirty = True
-
-    for section in config.sections():
-        if config.get(section, 'password', fallback=None):
-            config.set(section,
-                       'pwd',
-                       encrypt(config.get(section, 'password')))
-            config.remove_option(section, 'password')
-            dirty = True
-
-    if dirty:
-        with open(file_path, 'w') as f:
-            config.write(f)
-
-    return config
-
-
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(f"USAGE: {os.path.basename(__file__)} profile_name1 profile_name2 ...")
@@ -334,11 +297,11 @@ if __name__ == "__main__":
         exit()
 
     ini_path = os.path.join(os.path.dirname(__file__), 'ftpsync.ini')
-    profiles = load_ini(ini_path, ENCRYPT_PASSWORD)
+    profiles = load_config(ini_path, ENCRYPT_PASSWORD)
 
     # get names of profiles from command line
-    names = profiles.sections() if sys.argv[1] else sys.argv[1:]
-    names = [name for name in names if profiles.has_section(name)]
+    names = profiles.keys() if sys.argv[1] else sys.argv[1:]
+    names = [name for name in names if profiles.get(name)]
 
     print()
     (observers, queue_handlers) = start_monitor(names, profiles)
