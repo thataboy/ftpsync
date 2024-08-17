@@ -7,15 +7,20 @@ import time
 import sys
 from queue import Queue, Empty
 from threading import Thread, Event
-from crypty import encrypt, decrypt
+from constants import ENCRYPT_PASSWORD, REQUIRED_VALUES, ROOT_PROFILE
+from crypty import decrypt
 from config_loader import load_config
+
+from enum import Enum
 
 SYNC_FILE_DELETION = True
 SYNC_FOLDER_DELETION = True
-ENCRYPT_PASSWORD = True
 
-ERR_NO_DIR = 1
-ERR_OTHER = 2
+
+class FtpError(Enum):
+    NO_AUTHENTICATION = 1
+    NO_SUCH_FILE_OR_DIR = 2
+    OTHER = 9
 
 
 class FileOperation:
@@ -28,7 +33,7 @@ class FTPSUploadHandler(FileSystemEventHandler):
 
     def __init__(self, queue, ignore_regex):
         self.queue = queue
-        self.ignore_regex = re.compile(ignore_regex)
+        self.ignore_regex = ignore_regex
 
     def should_process(self, file_path):
         return self.ignore_regex is None or self.ignore_regex.search(file_path) is None
@@ -62,10 +67,22 @@ class FTPSHandler:
         self.errors = set()
 
     def connect(self):
-        self.ftps = FTP_TLS(self.ftp_host)
-        self.ftps.login(self.ftp_user, self.ftp_pwd)
-        self.ftps.prot_p()
-        self.ftps.cwd(self.remote_dir)
+        # don't bother if previously got authentication error
+        if FtpError.NO_AUTHENTICATION in self.errors:
+            return False
+        if self.ftps is None:
+            self.ftps = FTP_TLS(self.ftp_host)
+            try:
+                self.ftps.login(self.ftp_user, self.ftp_pwd)
+                self.ftps.prot_p()
+            except (error_perm, Exception) as e:
+                self.ftps = None
+                if isinstance(e, error_perm):
+                    self.errors.add(FtpError.NO_AUTHENTICATION)
+                print(f'Unable to connect to {self.ftp_host}: {e}')
+                print('Attempt no landing there')
+                return False
+        return True
 
     def close_connection(self):
         if self.ftps:
@@ -85,13 +102,13 @@ class FTPSHandler:
         return f'{self.remote_dir}/{relative_path}'
 
     def upload_file(self, file_path):
-        if self.ftps is None:
-            self.connect()
+        if not self.connect():
+            return
 
         remote_path = self.get_remote_path(file_path)
 
-        if ERR_NO_DIR in self.errors:
-            self.errors.discard(ERR_NO_DIR)
+        if FtpError.NO_SUCH_FILE_OR_DIR in self.errors:
+            self.errors.discard(FtpError.NO_SUCH_FILE_OR_DIR)
             remote_dir = os.path.dirname(remote_path)
             self.makedir(remote_dir)
 
@@ -100,22 +117,22 @@ class FTPSHandler:
                 self.ftps.storbinary(f'STOR {remote_path}', f)
             print(f"Uploaded: {file_path} -> {remote_path} at {time.ctime()}")
         except (error_perm, error_temp):
-            self.errors.add(ERR_NO_DIR)
+            self.errors.add(FtpError.NO_SUCH_FILE_OR_DIR)
             self.upload_file(file_path)
         except Exception as e:
-            retry = ERR_OTHER not in self.errors
+            retry = FtpError.OTHER not in self.errors
             print(f"Failed to upload {file_path}: {e}."
                   + " Retrying..." if retry else "")
             if retry:
                 # time.sleep(3)
                 self.ftps = None
-                self.errors.add(ERR_OTHER)
+                self.errors.add(FtpError.OTHER)
                 self.upload_file(file_path)
-            self.errors.discard(ERR_OTHER)
+            self.errors.discard(FtpError.OTHER)
 
     def delete_file(self, file_path):
-        if self.ftps is None:
-            self.connect()
+        if not self.connect():
+            return
 
         remote_path = self.get_remote_path(file_path)
 
@@ -125,15 +142,15 @@ class FTPSHandler:
         except (error_perm, error_temp) as e:
             print(f"{e}.")
         except Exception as e:
-            retry = ERR_OTHER not in self.errors
+            retry = FtpError.OTHER not in self.errors
             print(f"Failed to delete {remote_path}: {e}."
                   + " Retrying..." if retry else "")
             if retry:
                 # time.sleep(3)
                 self.ftps = None
-                self.errors.add(ERR_OTHER)
+                self.errors.add(FtpError.OTHER)
                 self.delete_file(file_path)
-            self.errors.discard(ERR_OTHER)
+            self.errors.discard(FtpError.OTHER)
 
     def delete_dir(self, file_path):
         remote_path = self.get_remote_path(file_path)
@@ -145,8 +162,8 @@ class FTPSHandler:
         """
         print(f'Removing: {path}')
 
-        if self.ftps is None:
-            self.connect()
+        if not self.connect():
+            return
 
         try:
             # get listing with type (file or dir or ??)
@@ -177,15 +194,15 @@ class FTPSHandler:
             print(f"{path} does not seem to exist on server.")
             return
         except Exception as e:
-            retry = ERR_OTHER not in self.errors
+            retry = FtpError.OTHER not in self.errors
             print(f"Failed to list {path}: {e}."
                   + " Retrying" if retry else "")
             if retry:
                 # time.sleep(3)
                 self.ftps = None
-                self.errors.add(ERR_OTHER)
+                self.errors.add(FtpError.OTHER)
                 self.do_delete_dir(path)
-            self.errors.discard(ERR_OTHER)
+            self.errors.discard(FtpError.OTHER)
             return
 
     def makedir(self, remote_dir):
@@ -227,15 +244,11 @@ class QueueHandler:
         self.stop_event.set()
 
 
-def start_monitor(names, profiles):
+def start_monitor(profiles):
     observers = []
     queue_handlers = []
 
-    for name in names:
-        profile = profiles[name]
-
-        if profile['local'].startswith('~'):
-            profile['local'] = os.path.expanduser(profile['local'])
+    for name, profile in profiles.items():
 
         ignore_regex = profile.get('ignore_regex')
 
@@ -268,7 +281,7 @@ def clean_up(observers, queue_handlers):
     for observer, _ in observers:
         observer.join(timeout=2)  # Wait for up to 2 seconds
         if observer.is_alive():
-            print(f"Warning: An observer didn't stop cleanly and may still be running.")
+            print("Warning: An observer didn't stop cleanly and may still be running.")
 
     # Stop all queue handlers and wait for queues to finish
     for queue_handler, queue_thread, queue in queue_handlers:
@@ -278,7 +291,7 @@ def clean_up(observers, queue_handlers):
     for _, queue_thread, _ in queue_handlers:
         queue_thread.join(timeout=2)  # Wait for up to 2 seconds
         if queue_thread.is_alive():
-            print(f"Warning: A queue thread didn't stop cleanly and may still be running.")
+            print("Warning: A queue thread didn't stop cleanly and may still be running.")
 
     # Close all FTP connections
     for _, handler in observers:
@@ -297,14 +310,10 @@ if __name__ == "__main__":
         exit()
 
     ini_path = os.path.join(os.path.dirname(__file__), 'ftpsync.ini')
-    profiles = load_config(ini_path, ENCRYPT_PASSWORD)
-
-    # get names of profiles from command line
-    names = profiles.keys() if sys.argv[1] else sys.argv[1:]
-    names = [name for name in names if profiles.get(name)]
+    profiles = load_config(ini_path, sys.argv)
 
     print()
-    (observers, queue_handlers) = start_monitor(names, profiles)
+    (observers, queue_handlers) = start_monitor(profiles)
     print()
 
     try:
