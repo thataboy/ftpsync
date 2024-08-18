@@ -11,68 +11,50 @@ REQUIRED_VALUES = {
     "pwd" if ENCRYPT_PASSWORD else "password",
     "local", "remote"
 }
+ROOT_NAME = '[default]'
 
 
-def mark_wanted(config, wanted, found):
+def encrypt_passwords(section, key, flag):
+    """Encrypts passwords in a section."""
+    if key == 'password' and section['password']:
+        section['pwd'] = encrypt(section['password'])
+        # walk does not like it when you delete a value in the root section
+        if section.parent is section:
+            section['password'] = None
+        else:
+            del section['password']
+        flag['dirty'] = True
+
+
+def mark_wanted(section, _, wanted, found):
     """mark sections given on command line"""
-    parent = config.parent
-    for sect in parent.sections:
-        section = parent[sect]
-        if sect in wanted:
-            section['wanted'] = 1
-            found.add(sect)
-        for subsect in section.sections:
-            mark_wanted(section[subsect], wanted, found)
+    if section.name in wanted:
+        section['wanted'] = 1
+        found.add(section.name)
 
 
-def cascade_values(config):
+def cascade_values(section, _):
     """Cascade values from parent sections to all child sections recursively.
        if the corresponding values are missing in child section
     """
-    parent = config.parent
-    for sect in parent.sections:
-        section = parent[sect]
-        for key in parent.scalars:
-            if key not in section:
-                section[key] = parent[key]
-        for subsect in section.sections:
-            cascade_values(section[subsect])
+    parent = section.parent
+    if parent is section:
+        return
+    for key in parent.scalars:
+        if key not in section and key != 'password':
+            section[key] = parent[key]
 
 
-def encrypt_passwords(config, dirty_in):
-    """walk through tree and encrypt plain passwords
-       returns True if changes were made
-    """
-    dirty = False or dirty_in
-    if 'password' in config:
-        config['pwd'] = encrypt(config['password'])
-        del config['password']
-        dirty = True
-    for sect in config.sections:
-        section = config[sect]
-        if 'password' in section:
-            section['pwd'] = encrypt(section['password'])
-            del section['password']
-            dirty = True
-        for subsect in section.sections:
-            dirty = dirty or encrypt_passwords(section[subsect], dirty)
-    return dirty
-
-
-def gather_profiles(config, take, profiles):
+def gather_profiles(section, _, take, profiles):
     """gather all sections and subsections into a flat unnested dict profiles
-       take = all was specified on command line
+       take = all or ALL was specified on command line
     """
-    parent = config.parent
-    for sect in parent.sections:
-        section = parent[sect]
-        if take == 'ALL' \
-           or section.get('wanted') \
-           or take == 'all' and not section.get('disabled'):
-            scalars = section.scalars
-            profiles[sect] = {key: section[key] for key in scalars}
-        for subsect in section.sections:
-            gather_profiles(section[subsect], take, profiles)
+    if take == 'ALL' \
+       or section.get('wanted') \
+       or take == 'all' and not section.get('disabled'):
+        if section.name not in profiles:
+            profiles[section.name or ROOT_NAME] = \
+                     {key: section[key] for key in section.scalars}
 
 
 def lint_profile(name, profile, bad_regexes):
@@ -91,7 +73,9 @@ def lint_profile(name, profile, bad_regexes):
 
     missing = REQUIRED_VALUES.difference(profile.keys())
     if len(missing) > 0:
-        print(f'Warning: {name} is missing {missing}. Skipping.')
+        # root section is expected to have missing values, that's normal
+        if name != ROOT_NAME:
+            print(f'Warning: {name} is missing {missing}. Skipping.')
         return False
 
     local = profile['local']
@@ -118,29 +102,30 @@ def load_config(file_path, argv):
     config = ConfigObj(file_path, interpolation=False)
 
     if ENCRYPT_PASSWORD:
-        dirty = encrypt_passwords(config, dirty_in=False)
-        if dirty:
+        flag = {'dirty': False}
+        config.walk(encrypt_passwords, flag=flag)
+        if flag['dirty']:
+            # special handling for password appearing at the root
+            if 'password' in config:
+                del config['password']
             config.write()
 
     take = argv[1] if (argv[1] in ['ALL', 'all'] and len(argv) == 2) else None
     if not take:
         wanted = set(argv[1:])
         found = set()
-        mark_wanted(config, wanted, found)
+        config.walk(mark_wanted, wanted=wanted, found=found)
         wanted -= found
         if len(wanted) > 0:
             print(f'Warning: Unknown profile(s) {wanted}')
 
-    cascade_values(config)
+    config.walk(cascade_values)
 
     profiles = {}
-    gather_profiles(config, take, profiles)
+    config.walk(gather_profiles, take=take, profiles=profiles)
 
     bad_regexes = set()
     profiles = {name: profile for name, profile in profiles.items()
                 if lint_profile(name, profile, bad_regexes)}
-
-    # print(profiles.keys())
-    # exit()
 
     return profiles

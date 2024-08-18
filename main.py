@@ -8,7 +8,7 @@ import sys
 from queue import Queue, Empty
 from threading import Thread, Event
 from crypty import decrypt
-from config_loader import load_config, ENCRYPT_PASSWORD, REQUIRED_VALUES
+from config_loader import load_config, ENCRYPT_PASSWORD
 
 from enum import Enum
 
