@@ -14,6 +14,8 @@ from enum import Enum
 
 SYNC_FILE_DELETION = True
 SYNC_FOLDER_DELETION = True
+SYNC_FILE_MOVE = True
+SYNC_FOLDER_MOVE = True
 
 
 class FtpError(Enum):
@@ -23,9 +25,10 @@ class FtpError(Enum):
 
 
 class FileOperation:
-    def __init__(self, operation, file_path):
-        self.operation = operation  # 'upload', 'delete', 'rmdir''
-        self.file_path = file_path
+    def __init__(self, operation, src_path, dest_path=None):
+        self.operation = operation
+        self.src_path = src_path
+        self.dest_path = dest_path
 
 
 class FTPSUploadHandler(FileSystemEventHandler):
@@ -34,18 +37,24 @@ class FTPSUploadHandler(FileSystemEventHandler):
         self.queue = queue
         self.ignore_regex = ignore_regex
 
-    def should_process(self, file_path):
-        return self.ignore_regex is None or self.ignore_regex.search(file_path) is None
+    def should_process(self, src_path):
+        return self.ignore_regex is None or self.ignore_regex.search(src_path) is None
 
     def on_modified(self, event):
+        print(f'{event}')
         if not event.is_directory and self.should_process(event.src_path):
             self.queue.put(FileOperation('upload', event.src_path))
 
     def on_created(self, event):
-        if not event.is_directory and self.should_process(event.src_path):
-            self.queue.put(FileOperation('upload', event.src_path))
+        print(f'{event}')
+        if self.should_process(event.src_path):
+            if event.is_directory:
+                self.queue.put(FileOperation('mkdir', event.src_path))
+            else:
+                self.queue.put(FileOperation('upload', event.src_path))
 
     def on_deleted(self, event):
+        print(f'{event}')
         if self.should_process(event.src_path):
             if event.is_directory:
                 if SYNC_FOLDER_DELETION:
@@ -53,6 +62,13 @@ class FTPSUploadHandler(FileSystemEventHandler):
             else:
                 if SYNC_FILE_DELETION:
                     self.queue.put(FileOperation('delete', event.src_path))
+
+    def on_moved(self, event):
+        if self.should_process(event.src_path):
+            # moving to same folder? i.e., renaming
+            if os.path.split(event.src_path)[:-1] == os.path.split(event.dest_path)[:-1]:
+                self.queue.put(FileOperation('rename', event.src_path, event.dest_path))
+            # TODO: implement moving
 
 
 class FTPSHandler:
@@ -90,50 +106,50 @@ class FTPSHandler:
             finally:
                 self.ftps = None
 
-    def get_remote_path(self, file_path):
+    def get_remote_path(self, src_path):
         """
         Translate local to remote path based
         on the `local` and `remote` root folders in config
         """
-        relative_path = os.path.relpath(file_path, start=self.local_folder)
+        relative_path = os.path.relpath(src_path, start=self.local_folder)
         # normalize path so Windows path becomes Unix path
         relative_path = os.path.normpath(relative_path).replace(os.sep, '/')
         return f'{self.remote_dir}/{relative_path}'
 
-    def upload_file(self, file_path):
+    def upload_file(self, src_path):
         if not self.connect():
             return
 
-        remote_path = self.get_remote_path(file_path)
+        remote_path = self.get_remote_path(src_path)
 
         if FtpError.NO_SUCH_FILE_OR_DIR in self.errors:
             self.errors.discard(FtpError.NO_SUCH_FILE_OR_DIR)
             remote_dir = os.path.dirname(remote_path)
-            self.makedir(remote_dir)
+            self.do_make_dir(remote_dir)
 
         try:
-            with open(file_path, 'rb') as f:
+            with open(src_path, 'rb') as f:
                 self.ftps.storbinary(f'STOR {remote_path}', f)
-            print(f"Uploaded: {file_path} -> {remote_path} at {time.ctime()}")
+            print(f"Uploaded: {src_path} -> {remote_path} at {time.ctime()}")
         except (error_perm, error_temp):
             self.errors.add(FtpError.NO_SUCH_FILE_OR_DIR)
-            self.upload_file(file_path)
+            self.upload_file(src_path)
         except Exception as e:
             retry = FtpError.OTHER not in self.errors
-            print(f"Failed to upload {file_path}: {e}."
+            print(f"Failed to upload {src_path}: {e}."
                   + " Retrying..." if retry else "")
             if retry:
                 # time.sleep(3)
                 self.ftps = None
                 self.errors.add(FtpError.OTHER)
-                self.upload_file(file_path)
+                self.upload_file(src_path)
             self.errors.discard(FtpError.OTHER)
 
-    def delete_file(self, file_path):
+    def delete_file(self, src_path):
         if not self.connect():
             return
 
-        remote_path = self.get_remote_path(file_path)
+        remote_path = self.get_remote_path(src_path)
 
         try:
             self.ftps.delete(remote_path)
@@ -148,25 +164,72 @@ class FTPSHandler:
                 # time.sleep(3)
                 self.ftps = None
                 self.errors.add(FtpError.OTHER)
-                self.delete_file(file_path)
+                self.delete_file(src_path)
             self.errors.discard(FtpError.OTHER)
 
-    def delete_dir(self, file_path):
-        remote_path = self.get_remote_path(file_path)
+    def rename(self, src_path, dest_path):
+        """rename file or dir"""
+        if not self.connect():
+            return
+
+        remote_path = self.get_remote_path(src_path)
+        remote_dest_path = self.get_remote_path(dest_path)
+
+        try:
+            self.ftps.rename(remote_path, remote_dest_path)
+            print(f"Renamed: {remote_path} to {remote_dest_path} at {time.ctime()}")
+        except (error_perm, error_temp) as e:
+            print(f"{e}.")
+        except Exception as e:
+            retry = FtpError.OTHER not in self.errors
+            print(f"Failed to rename {remote_path}: {e}."
+                  + " Retrying..." if retry else "")
+            if retry:
+                # time.sleep(3)
+                self.ftps = None
+                self.errors.add(FtpError.OTHER)
+                self.rename(src_path)
+            self.errors.discard(FtpError.OTHER)
+
+    def make_dir(self, src_path):
+        if not self.connect():
+            return
+
+        remote_path = self.get_remote_path(src_path)
+
+        try:
+            self.do_make_dir(remote_path)
+        except (error_perm, error_temp) as e:
+            print(f"{e}.")
+        except Exception as e:
+            retry = FtpError.OTHER not in self.errors
+            print(f"Failed to mkdir {remote_path}: {e}."
+                  + " Retrying..." if retry else "")
+            if retry:
+                # time.sleep(3)
+                self.ftps = None
+                self.errors.add(FtpError.OTHER)
+                self.make_dir(src_path)
+            self.errors.discard(FtpError.OTHER)
+
+    def delete_dir(self, src_path):
+        remote_path = self.get_remote_path(src_path)
         self.do_delete_dir(remote_path)
 
     def do_delete_dir(self, path):
         """
         Recursively deletes a remote ftp folder and its contents.
         """
-        print(f'Removing: {path}')
 
         if not self.connect():
             return
 
         try:
             # get listing with type (file or dir or ??)
+            print(path)
             listing = self.ftps.mlsd(path, facts=['type'])
+            print(next(listing, None))
+            print('here')
 
             for (item, fact) in listing:
                 if item in ['.', '..']:
@@ -182,15 +245,16 @@ class FTPSHandler:
                     except Exception as e:
                         print(f"{e}.")
 
-            # Delete the now (hopefully) empty directory
+            Delete the now (hopefully) empty directory
             try:
+                print(f'Removing: {path}')
                 self.ftps.rmd(path)
                 print(f'Removed: {path}')
             except Exception as e:
                 print(f"{e}.")
 
         except (error_perm, error_temp) as e:
-            print(f"{path} does not seem to exist on server.")
+            print(f"{path} does not seem to exist on server. {e}")
             return
         except Exception as e:
             retry = FtpError.OTHER not in self.errors
@@ -204,7 +268,7 @@ class FTPSHandler:
             self.errors.discard(FtpError.OTHER)
             return
 
-    def makedir(self, remote_dir):
+    def do_make_dir(self, remote_dir):
         self.ftps.cwd(self.remote_dir)
         relative_path = os.path.relpath(remote_dir, start=self.remote_dir)
         # ASSume FTP uses unix path
@@ -230,11 +294,15 @@ class QueueHandler:
             try:
                 operation = self.queue.get(timeout=1)  # Wait for 1 second
                 if operation.operation == 'upload':
-                    self.ftps_handler.upload_file(operation.file_path)
+                    self.ftps_handler.upload_file(operation.src_path)
                 elif operation.operation == 'delete':
-                    self.ftps_handler.delete_file(operation.file_path)
+                    self.ftps_handler.delete_file(operation.src_path)
+                elif operation.operation == 'mkdir':
+                    self.ftps_handler.make_dir(operation.src_path)
                 elif operation.operation == 'rmdir':
-                    self.ftps_handler.delete_dir(operation.file_path)
+                    self.ftps_handler.delete_dir(operation.src_path)
+                elif operation.operation == 'rename':
+                    self.ftps_handler.rename(operation.src_path, operation.dest_path)
                 self.queue.task_done()
             except Empty:
                 continue  # If queue is empty, continue the loop
@@ -280,7 +348,7 @@ def clean_up(observers, queue_handlers):
     for observer, _ in observers:
         observer.join(timeout=2)  # Wait for up to 2 seconds
         if observer.is_alive():
-            print("Warning: An observer didn't stop cleanly and may still be running.")
+            print("Warning: An ππobserver didn't stop cleanly and may still be running.")
 
     # Stop all queue handlers and wait for queues to finish
     for queue_handler, queue_thread, queue in queue_handlers:
