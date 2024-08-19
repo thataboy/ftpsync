@@ -110,7 +110,11 @@ def load_config(file_path, argv):
         change password=<value> to pwd=<encrypted value>
         and rewrite the ini file
     """
-    config = ConfigObj(file_path, interpolation=False)
+    try:
+        config = ConfigObj(file_path, interpolation=False)
+    except Exception as e:
+        print(f'Cannot load {file_path}:\n{e}')
+        exit()
 
     if ENCRYPT_PASSWORD:
         flag = {'dirty': False}
