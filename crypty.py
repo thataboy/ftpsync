@@ -1,7 +1,27 @@
+import os
 from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
 import base64
 
-CRYPT = b'\xde\x89<\xee\x94\xfb\xd1\x96\xed\x12#V\xf7.\x98\x18\xae\xa66\x1e{\xf1d\xeaa\x9d\xa4o]`\x96\x06'
+CRYPT_KEY_FILE = os.path.expanduser("~/.ftpsync.rand")
+
+
+def load_key():
+    """Loads the encryption key from the external file."""
+    if os.path.exists(CRYPT_KEY_FILE):
+        with open(CRYPT_KEY_FILE, "rb") as f:
+            return f.read()
+    else:
+        # Generate a new key and save it to the file
+        key = get_random_bytes(32)
+        with open(CRYPT_KEY_FILE, "wb") as f:
+            f.write(key)
+        # Set permissions to 400 (read-only for owner)
+        os.chmod(CRYPT_KEY_FILE, 0o400)
+        return key
+
+
+CRYPT = load_key()
 
 
 def encrypt(password, key=CRYPT):
@@ -18,9 +38,3 @@ def decrypt(encrypted_password, key=CRYPT):
     cipher = AES.new(key, AES.MODE_ECB)
     decrypted_password = cipher.decrypt(encrypted_password).decode('utf-8')
     return decrypted_password.strip()  # Remove padding
-
-
-if __name__ == "__main__":
-    from Crypto.Random import get_random_bytes
-    print(f'# randomly generated key')
-    print(f'CRYPT = {get_random_bytes(32)}')
