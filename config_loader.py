@@ -1,8 +1,8 @@
-from configobj import ConfigObj
+from configobj import ConfigObj, Section
 from crypty import encrypt
 import re
 import os
-
+import sys
 
 ENCRYPT_PASSWORD = True
 REQUIRED_VALUES = {
@@ -36,8 +36,8 @@ def mark_wanted(parent, key, wanted, found):
 
     section = parent[key]
     # walk with call_on_sections=True
-    # ignore scalars, only checking for sections, i.e. dicts
-    if isinstance(section, dict):
+    # ignore scalars, only checking for sections
+    if isinstance(section, Section):
         if section.name in wanted:
             section[WANTED_KEY] = 1
             found.add(section.name)
@@ -48,7 +48,7 @@ def cascade_values(parent, key):
        if the corresponding values are missing in child section
     """
     section = parent[key]
-    if isinstance(section, dict):
+    if isinstance(section, Section):
         for key in parent.scalars:
             if key not in section and key != 'password':
                 section[key] = parent[key]
@@ -59,12 +59,14 @@ def gather_profiles(parent, key, take, profiles):
        take == {all|ALL|None}
     """
     section = parent[key]
-    if isinstance(section, dict):
+    if isinstance(section, Section):
         if take == 'ALL' \
            or section.get(WANTED_KEY) \
            or take == 'all' and not section.get('disabled'):
-            profiles[section.name or ROOT_NAME] = \
-                     {key: section[key] for key in section.scalars}
+            name = section.name or ROOT_NAME
+            profiles[name] = {key: section[key] for key in section.scalars}
+            profiles[name]['name'] = f'{section.depth * '['}{section.name}{section.depth * ']'}' \
+                                     if section.name else ROOT_NAME
 
 
 def lint_profile(name, profile, bad_regexes):
@@ -74,7 +76,7 @@ def lint_profile(name, profile, bad_regexes):
     """
     if profile.get('ignore_regex'):
         try:
-            profile['ignore_regex'] = re.compile(profile['ignore_regex'])
+            profile['ignore_regex'] = re.compile(profile['ignore_regex'], re.VERBOSE)
         except Exception as e:
             if profile['ignore_regex'] not in bad_regexes:
                 bad_regexes.add(profile['ignore_regex'])
@@ -104,7 +106,7 @@ def load_config(file_path, argv):
     """Loads and processes config ini
     Args:
         file_path: The path to the INI file.
-        argv: command line arguments
+        argv: list of profiles from command line
     Returns: dict of valid, wqnted profiles
     Note: if ENCRYPT_PASSWORD: if True,
         change password=<value> to pwd=<encrypted value>
@@ -114,7 +116,7 @@ def load_config(file_path, argv):
         config = ConfigObj(file_path, interpolation=False)
     except Exception as e:
         print(f'Cannot load {file_path}:\n{e}')
-        exit()
+        sys.exit(1)
 
     if ENCRYPT_PASSWORD:
         flag = {'dirty': False}
@@ -126,9 +128,9 @@ def load_config(file_path, argv):
             config.write()
             print(f'Changes written to {file_path}.')
 
-    take = argv[1] if (argv[1] in ['ALL', 'all'] and len(argv) == 2) else None
+    take = argv[0] if (argv[0] in ['ALL', 'all'] and len(argv) == 1) else None
     if not take:
-        wanted = set(argv[1:])
+        wanted = set(argv)
         found = set()
         config.walk(mark_wanted, call_on_sections=True, wanted=wanted, found=found)
         wanted -= found

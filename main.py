@@ -8,6 +8,8 @@ from queue import Queue, Empty
 from threading import Thread, Event
 from crypty import decrypt
 from config_loader import load_config, ENCRYPT_PASSWORD
+from datetime import datetime, timedelta
+import argparse
 
 from enum import Enum
 
@@ -328,7 +330,7 @@ def start_monitor(profiles):
     observers = []
     queue_handlers = []
 
-    for name, profile in profiles.items():
+    for profile in profiles.values():
 
         ignore_regex = profile.get('ignore_regex')
 
@@ -347,7 +349,7 @@ def start_monitor(profiles):
         observers.append((observer, ftps_handler))
         queue_handlers.append((queue_handler, queue_thread, queue))
 
-        print(f"Monitoring {name}: {profile['local']} -> {profile['remote']}")
+        print(f"Monitoring {profile['name']}: {profile['local']} -> {profile['remote']}")
     return (observers, queue_handlers)
 
 
@@ -383,34 +385,107 @@ def clean_up(observers, queue_handlers):
     print('Cleanup completed')
 
 
+def parse_time_string(time_string):
+    unit = time_string[-1].lower()
+    value = int(time_string[:-1])
+    if unit == 'd':
+        return timedelta(days=value)
+    elif unit == 'h':
+        return timedelta(hours=value)
+    elif unit == 'm':
+        return timedelta(minutes=value)
+    elif unit == 's':
+        return timedelta(seconds=value)
+    else:
+        raise ValueError("Invalid time unit. Use 'd' for days, 'h' for hours, 'm' for minutes, 's' for seconds'.")
+
+
+def get_files_to_sync(profile, modified_since):
+    files_to_sync = []
+    for root, _, files in os.walk(profile['local']):
+        for file in files:
+            file_path = os.path.join(root, file)
+            if profile['ignore_regex'] is None or profile['ignore_regex'].search(file_path) is None:
+                if os.path.getmtime(file_path) > modified_since:
+                    files_to_sync.append(file_path)
+    return files_to_sync
+
+
+def manual_sync(profile, modified_since, sync=False):
+    files_to_sync = get_files_to_sync(profile, modified_since)
+
+    if not sync:
+        print(f"Files that would be uploaded:")
+        for file in files_to_sync:
+            print(f"  {file}")
+        return
+
+    queue = Queue()
+    ftps_handler = FTPSHandler(profile)
+
+    for file_path in files_to_sync:
+        queue.put(FileOperation('upload', file_path))
+
+    queue_handler = QueueHandler(queue, ftps_handler)
+    queue_thread = Thread(target=queue_handler.process_queue)
+    queue_thread.daemon = True
+    queue_thread.start()
+
+    queue.join()  # Wait for all tasks to be processed
+    queue_handler.stop()
+    queue_thread.join()
+    ftps_handler.disconnect()
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        script = os.path.basename(__file__)
-        print("USAGE:")
-        print(f"       {script} profile_name1 profile_name2 ...")
-        print(f"   or  {script} all      to use all profiles")
-        print(f"   or  {script} ALL      to use all profiles, override disabled")
-        exit()
+    parser = argparse.ArgumentParser(description="FTP Sync Tool")
+    parser.add_argument('profiles', nargs='+',
+                        help='Profile(s) to monitor or sync. Or all = all profiles; ALL = all profiles, including disabled ones')
+    parser.add_argument("-m", "--modified",
+                        help="Sync files modified within <integer><time_unit> (e.g.: 30d | 12h | 15m | 30s)")
+    parser.add_argument("-s", "--sync", action="store_true", help="Sync files (by default, only a preview is shown)")
+
+    args = parser.parse_args()
+
+    if ('all' in args.profiles or 'ALL' in args.profiles) and len(args.profiles) > 1:
+        print(f'all, ALL, and profile(s) may not be used together.')
+        sys.exit(1)
+
+    if args.sync and not args.modified:
+        print("-s (--sync) requires the -m (--modified) option. Please specify a time range.")
+        sys.exit(1)
 
     ini_path = os.path.join(os.path.dirname(__file__), 'ftpsync.ini')
 
     if not os.path.exists(ini_path):
         print(f'{ini_path} does not exist.')
-        exit()
+        sys.exit(1)
 
-    profiles = load_config(ini_path, sys.argv)
+    profiles = load_config(ini_path, args.profiles)
     if len(profiles) == 0:
         print('No valid profiles enabled. Nothing to do.')
-        exit()
+        sys.exit(1)
 
-    print()
-    (observers, queue_handlers) = start_monitor(profiles)
-    print()
+    if args.modified:
+        try:
+            time_delta = parse_time_string(args.modified)
+            modified_since = datetime.now() - time_delta
+            for profile in profiles.values():
+                mode = 'Manually syncing' if args.sync else 'Previewing'
+                print(f"\n{mode} profile {profile['name']}: {profile['local']} -> {profile['remote']}")
+                manual_sync(profile, modified_since.timestamp(), args.sync)
+        except Exception as e:
+            print(f"{e}")
+            sys.exit(1)
+    else:
+        print()
+        (observers, queue_handlers) = start_monitor(profiles)
+        print()
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nScript interrupted")
-    finally:
-        clean_up(observers, queue_handlers)
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nScript interrupted")
+        finally:
+            clean_up(observers, queue_handlers)
