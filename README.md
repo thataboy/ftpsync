@@ -18,6 +18,14 @@ The program works in two modes:
 - Monitor: runs in the background, monitors for local file changes, and mirrors the changes to remote FTPS server
 - Sync: does a one time upload of files that have been modified since some specified time, e.g., last 12 hours.
 
+### Caveats
+
+- ftpsync supports a one way local -> server sync only.
+
+- It has a queuing system and each queue runs in a thread, so it can handle a sizeable file dump into a monitored folder. However, it is somewhat slow (because Python) and is intended to be used as a dev tool, not a robust FTP client.
+
+- There are some weirdness when doing archive compression / decompression in the Mac Finder which causes problems for ftpsync. This doesn't appear to happen while working with archives in the shell.
+
 ## Requirements
 
 - Python 3.6+
@@ -46,6 +54,7 @@ ignore_regex = '''(
     ^\. |                  # ignore hidden files
     \/\. |                 # ignore hidden folder
     \.(tmp | log | bak)$ |
+    __MACOSX |
     ftpsync\.ini$          # probably a good idea
     )'''
 
@@ -77,7 +86,7 @@ password = hellothere
 
 ```
 
-The file format is hopefully self-explanatory. It uses the familiar ini file structure where each section, denoted by `[name]`, and subsection, denoted by [[name]] represents a profile. Each profile consists of
+The file format is hopefully self-explanatory. It uses the familiar ini file structure where each section, denoted by `[name]`, and subsection, denoted by `[[name]]` represents a profile. Each profile consists of
 
 - `host`: name of ftp host
 - `user`: username
@@ -97,11 +106,11 @@ This inheritance system allows you to set common parameters (like FTP server det
 
 - The `remote` folder *must already exist*. The program will create sub-folders as needed but it will not create the "root" folder.
 
-- *When you run the program, all plain text `password`s will be encrypted* and `password = 12345` becomes `pwd = ofTHava7Hj45pzI++fQdVQO6PRSbQh9TjCBXQvTIbU4=` (for example). If you need to change the password, simply add `password = newpassword` back in and it will be encrypted again when you run the program. The encryption key is randomly generated and placed in ~/.ftpsync.rand
+- **When you run the program, all plain text `password`s will be encrypted**. `password = 12345` becomes `pwd = ofTHava7Hj45pzI++fQdVQO6PRSbQh9TjCBXQvTIbU4=` (for example) and any changes are written to the ini file. If you need to change the password, simply add `password = newpassword` back in and it will be encrypted again when you run the program. The encryption key is randomly generated and placed in ~/.ftpsync.rand
 
 - `ignore_regex` is compiled with the flag `re.VERBOSE`. What this means is white space in the regex will be ignored, so you may use blank spaces and newlines to make the regex more readable. You can also have comments, as the example shows. What this also means, however, is you must explicitly use `\s` to denote a space.
 
-- `ignore_regex` can be multi lines. You just need to wrap with triple single `'''` or double quotes `"""`
+- `ignore_regex` can be multi lines. Wrap multi line strings with triple single `'''` or double quotes `"""`
 
 ## Usage
 
@@ -145,12 +154,6 @@ options:
                         Sync files modified within <integer><time_unit> (e.g.: 30d | 12h | 15m | 30s)
   -s, --sync            Sync files (by default, only a preview is shown)
 ```
-
-## Caveats
-
-ftpsync supports a one way local -> server sync only.
-
-It has a queuing system and each queue runs in a thread, so it can handle a sizeable file dump into a monitored folder. However, it is somewhat slow (because Python) and is intended to be a dev tool, not a robust FTP client.
 
 ## Additional Notes
 
