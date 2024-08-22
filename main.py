@@ -10,6 +10,7 @@ from crypty import decrypt
 from config_loader import load_config, ENCRYPT_PASSWORD
 from datetime import datetime, timedelta
 import argparse
+from collections import defaultdict
 
 from enum import Enum
 
@@ -48,7 +49,10 @@ class FileMonitorHandler(FileSystemEventHandler):
         if not event.is_directory and self.should_process(event.src_path):
             # when you duplicate a file, Mac generates a FileCreatedEvent
             # and FileModifiedEvent in quick succession, causing duplicate upload
-            stat_result = os.stat(event.src_path)
+            try:
+                stat_result = os.stat(event.src_path)
+            except Exception:
+                return
             ctime = stat_result.st_ctime
             mtime = stat_result.st_mtime
             if mtime - ctime > 0.05:
@@ -275,35 +279,109 @@ class FTPSHandler:
         return self.do_op(do_delete_dir, 'rmdir', remote_path)
 
 
+class BatchTracker:
+    def __init__(self, time_threshold=1.0, path_levels=3):
+        self.counts = defaultdict(lambda: {'success': 0, 'failure': 0})
+        self.last_operation = None
+        self.last_operation_time = None
+        self.last_src_path = None
+        self.time_threshold = time_threshold
+        self.path_levels = path_levels
+        self.batch_start_time = None
+        self.compatible_operations = {
+            'mkdir': ['mkdir', 'upload'],
+            'upload': ['upload', 'mkdir'],
+            'delete': ['delete', 'rmdir'],
+            'rmdir': ['rmdir', 'delete'],
+            'rename': ['rename'],
+            'move': ['mkdir', 'move']
+        }
+
+    def get_path_key(self, src_path):
+        parts = os.path.normpath(src_path).split(os.sep)
+        return os.sep.join(parts[:-self.path_levels])
+
+    def is_new_batch(self, operation, src_path, current_time):
+        if self.last_operation is None:
+            return True
+        if operation not in self.compatible_operations.get(self.last_operation, []):
+            return True
+        if current_time - self.last_operation_time > self.time_threshold:
+            return True
+        # if self.get_path_key(src_path) != self.get_path_key(self.last_src_path):
+        #     return True
+        return False
+
+    def record(self, operation, src_path, success):
+        current_time = time.time()
+
+        if self.is_new_batch(operation, src_path, current_time):
+            self.report()
+            self.batch_start_time = current_time
+
+        self.counts[operation]['success' if success else 'failure'] += 1
+        self.counts['total']['success' if success else 'failure'] += 1
+        self.last_operation = operation
+        self.last_operation_time = current_time
+        self.last_src_path = src_path
+
+    def report(self):
+        if self.batch_start_time is None:
+            return
+
+        if self.counts['total']['success'] + self.counts['total']['failure'] > 1:
+            print("\nBatch Summary:")
+            total = self.counts.pop('total')
+            for op, counts in self.counts.items():
+                print(f"{op.capitalize()}: {counts['success']} successful, {counts['failure']} failed")
+            print(f"Total: {total['success']} successful, {total['failure']} failed")
+
+            duration = time.time() - self.batch_start_time
+            print(f"Batch duration: {duration:.2f} seconds")
+
+        self.counts.clear()
+        self.batch_start_time = None
+
+
 class QueueHandler:
     def __init__(self, queue, ftps_handler):
         self.queue = queue
         self.ftps_handler = ftps_handler
         self.stop_event = Event()
+        self.batch_tracker = BatchTracker()
+        self.is_empty = True
 
     def process_queue(self):
         while not self.stop_event.is_set():
             try:
-                operation = self.queue.get(timeout=1)  # Wait for 1 second
-                # print(operation.operation, operation.src_path, operation.dest_path)
+                operation = self.queue.get(timeout=1)
+                success = False
+                if self.is_empty:
+                    self.is_empty = False
+                    print()
                 if operation.operation == 'upload':
-                    self.ftps_handler.upload(operation.src_path)
+                    success = self.ftps_handler.upload(operation.src_path)
                 elif operation.operation == 'delete':
-                    self.ftps_handler.delete_file(operation.src_path)
+                    success = self.ftps_handler.delete_file(operation.src_path)
                 elif operation.operation == 'mkdir':
-                    self.ftps_handler.make_dir(operation.src_path)
+                    success = self.ftps_handler.make_dir(operation.src_path)
                 elif operation.operation == 'rmdir':
-                    self.ftps_handler.delete_dir(operation.src_path)
+                    success = self.ftps_handler.delete_dir(operation.src_path)
                 elif operation.operation == 'rename':
-                    self.ftps_handler.rename(operation.src_path, operation.dest_path)
+                    success = self.ftps_handler.rename(operation.src_path, operation.dest_path)
                 elif operation.operation == 'move':
-                    self.ftps_handler.move(operation.src_path, operation.dest_path)
+                    success = self.ftps_handler.move(operation.src_path, operation.dest_path)
+
+                self.batch_tracker.record(operation.operation, operation.src_path, success)
                 self.queue.task_done()
             except Empty:
-                continue  # If queue is empty, continue the loop
+                self.batch_tracker.report()  # Report any remaining operations
+                self.is_empty = True
+                continue
 
     def stop(self):
         self.stop_event.set()
+        self.batch_tracker.report()  # Final report when stopping
 
 
 def start_monitor(profiles):
@@ -343,7 +421,7 @@ def clean_up(observers, queue_handlers):
     for observer, _ in observers:
         observer.join(timeout=2)  # Wait for up to 2 seconds
         if observer.is_alive():
-            print("Warning: An ππobserver didn't stop cleanly and may still be running.")
+            print("Warning: An observer didn't stop cleanly and may still be running.")
 
     # Stop all queue handlers and wait for queues to finish
     for queue_handler, _, _ in queue_handlers:
@@ -460,7 +538,6 @@ if __name__ == "__main__":
     else:
         print()
         (observers, queue_handlers) = start_monitor(profiles)
-        print()
 
         try:
             while True:
