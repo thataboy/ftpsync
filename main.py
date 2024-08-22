@@ -251,9 +251,12 @@ class FTPSHandler:
         remote_path = self.get_remote_path(src_path)
         return self.do_op(do_make_dir, 'mkdir', remote_path)
 
+
     def delete_dir(self, src_path):
 
         def do_delete_dir(path):
+            counts = defaultdict(lambda: {'success': 0, 'failure': 0})
+
             try:
                 listing = self.ftps.mlsd(path, facts=['type'])
                 for (item, fact) in listing:
@@ -261,22 +264,34 @@ class FTPSHandler:
                         continue
                     full_path = f"{path}/{item}"
                     if fact['type'] == 'dir':
-                        do_delete_dir(full_path)
+                        subdir_counts = do_delete_dir(full_path)
+                        for op in ['delete', 'rmdir']:
+                            counts[op]['success'] += subdir_counts[op]['success']
+                            counts[op]['failure'] += subdir_counts[op]['failure']
                     elif fact['type'] == 'file':
                         try:
                             self.ftps.delete(full_path)
+                            counts['delete']['success'] += 1
                             print(f'Deleted: {full_path}')
                         except Exception as e:
-                            print(f"Unable to delete {full_path} {e}.")
+                            counts['delete']['failure'] += 1
+                            print(f"Unable to delete {full_path}: {e}")
+
                 self.ftps.rmd(path)
+                counts['rmdir']['success'] += 1
                 print(f'Removed: {path}')
-                return True
             except error_perm as e:
-                print(f"{path} does not seem to exist on server. {e}")
-            return False
+                counts['rmdir']['failure'] += 1
+                print(f"Unable to delete {path}: {e}")
+
+            return counts
 
         remote_path = self.get_remote_path(src_path)
-        return self.do_op(do_delete_dir, 'rmdir', remote_path)
+        counts = self.do_op(do_delete_dir, 'rmdir', remote_path)
+        if counts:
+            for item in ['success', 'failure']:
+                counts['total'][item] = counts['rmdir'][item] + counts['delete'][item]
+        return counts
 
 
 class BatchTracker:
@@ -292,7 +307,7 @@ class BatchTracker:
             'mkdir': ['mkdir', 'upload'],
             'upload': ['upload', 'mkdir'],
             'delete': ['delete', 'rmdir'],
-            'rmdir': ['rmdir', 'delete'],
+            'rmdir': [],
             'rename': ['rename'],
             'move': ['mkdir', 'move']
         }
@@ -319,8 +334,10 @@ class BatchTracker:
             self.report()
             self.batch_start_time = current_time
 
-        self.counts[operation]['success' if success else 'failure'] += 1
-        self.counts['total']['success' if success else 'failure'] += 1
+        if operation != 'rmdir':
+            self.counts[operation]['success' if success else 'failure'] += 1
+            self.counts['total']['success' if success else 'failure'] += 1
+
         self.last_operation = operation
         self.last_operation_time = current_time
         self.last_src_path = src_path
@@ -366,13 +383,17 @@ class QueueHandler:
                 elif operation.operation == 'mkdir':
                     success = self.ftps_handler.make_dir(operation.src_path)
                 elif operation.operation == 'rmdir':
-                    success = self.ftps_handler.delete_dir(operation.src_path)
+                    # rmdir does a pseudo record to start a new batch
+                    self.batch_tracker.record('rmdir', '', None)
+                    self.batch_tracker.counts = self.ftps_handler.delete_dir(operation.src_path)
+                    self.batch_tracker.report()
                 elif operation.operation == 'rename':
                     success = self.ftps_handler.rename(operation.src_path, operation.dest_path)
                 elif operation.operation == 'move':
                     success = self.ftps_handler.move(operation.src_path, operation.dest_path)
 
-                self.batch_tracker.record(operation.operation, operation.src_path, success)
+                if operation.operation != 'rmdir':
+                    self.batch_tracker.record(operation.operation, operation.src_path, success)
                 self.queue.task_done()
             except Empty:
                 self.batch_tracker.report()  # Report any remaining operations
