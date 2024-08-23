@@ -96,13 +96,11 @@ The file format is hopefully self-explanatory. It uses the familiar ini file str
 - `ignore_regex`: (optional) a regex string to indicate which files should be ignored
 - `disabled`: (optional) set to 1 to disable the profile.
 
-Each section inherits all settings above it and can override any setting. This avoids duplication and allows for more concise and maintainable configurations.
-
-This inheritance system allows you to set common parameters (like FTP server details) once for multiple related profiles, reducing repetition and potential errors.
+Each section inherits all settings above it and can override any setting. This avoids duplication and allows more concise and maintainable configs.
 
 ### Some notes on the config file
 
-- The subsection indentation is simply for looks and completely optional. It's not Python!
+- The subsection indentation is just for looks and completely optional. It's not Python!
 
 - The `remote` folder *must already exist*. The program will create sub-folders as needed but it will not create the "root" folder.
 

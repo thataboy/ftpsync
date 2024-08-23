@@ -1,4 +1,5 @@
 import os
+from os.path import basename
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from ftplib import FTP_TLS, error_perm
@@ -20,6 +21,7 @@ SYNC_FILE_MOVE = True
 SYNC_FOLDER_MOVE = True
 MAX_RETRIES = 3
 RETRY_DELAY = 3  # seconds
+SHOW_FULL_PATH = False
 
 
 class FtpError(Enum):
@@ -90,20 +92,13 @@ class FileMonitorHandler(FileSystemEventHandler):
 
     def on_modified(self, event):
         if not event.is_directory:
-            try:
-                stat_result = os.stat(event.src_path)
-            except Exception:
-                return
-            ctime = stat_result.st_ctime
-            mtime = stat_result.st_mtime
-            # when duplicating in Finder, it generates a created followed immediately by modified event
-            # this check prevents double uploads
-            if mtime - ctime > 0.05:
-                self.queue_operation('upload', event.src_path)
+            self.queue_operation('upload', event.src_path)
 
     def on_created(self, event):
-        op = 'mkdir' if event.is_directory else 'upload'
-        self.queue_operation(op, event.src_path)
+        # there seems no need to check for file created event
+        # since it will be followed by file modified. This simplifies things
+        if event.is_directory:
+            self.queue_operation('mkdir', event.src_path)
 
     def on_deleted(self, event):
         if not SYNC_FOLDER_DELETION and event.is_directory or \
@@ -162,25 +157,6 @@ class FTPSHandler:
                 self.ftps = None
 
     def do_op(self, func, op_name, *args, **kwargs):
-        """
-        The main retry and exception handling loop for FTPSHandler
-
-        Args:
-            func (callable): The function (FTP operation) to call.
-                func should return boolean to indicate succesful operation,
-                or causes an Exception
-            op_name (str): The name of the operation (for logging purposes).
-            *args, **kwargs: args and kwargs to pass to func
-
-        Returns:
-            (boolean) whether operation was successful.
-
-        Notes:
-            This method will retry the operation up to self.max_retries times if it fails,
-            waiting self.retry_delay seconds between retries.
-        """
-
-        # don't bother if previously got authentication error
         if FtpError.NO_AUTHENTICATION in self.errors:
             return False
 
@@ -199,63 +175,81 @@ class FTPSHandler:
                 perm = isinstance(e, error_perm)
                 if perm and op_name == 'connect':
                     self.errors.add(FtpError.NO_AUTHENTICATION)
-                    print(f"Cannot connect to {self.ftp_host}: {e}.")
-                    print(f"Dave, this conversation can serve no purpose anymore. Goodbye.")
+                    self.log(f"Cannot connect to {self.ftp_host}: {e}.")
+                    self.log(f"Dave, this conversation can serve no purpose anymore. Goodbye.")
                     return False
                 if perm or attempt >= self.max_retries - 1:
                     quit = '' if perm else f'Gave up after {self.max_retries} attempts.'
-                    print(f"Failed to {op_name} {txt}: {e}. {quit}")
+                    self.log(f"Failed to {op_name} {txt}: {e}. {quit}")
                     return False
-                print(f"Unable to {op_name} {txt}: {e}. Retrying in {self.retry_delay} seconds...")
+                self.log(f"Unable to {op_name} {txt}: {e}. Retrying in {self.retry_delay} seconds...")
                 self.disconnect()
                 time.sleep(self.retry_delay)
 
     def get_remote_path(self, src_path):
-        """
-        Translate local to remote path based on the `local` and `remote` root folders in config
-        """
         relative_path = os.path.relpath(src_path, start=self.local_folder)
-        # normalize path so Windows path becomes Unix path
         relative_path = os.path.normpath(relative_path).replace(os.sep, '/')
         return f'{self.remote_dir}/{relative_path}'
 
-    def upload(self, src_path):
+    def log(self, txt):
+        now = datetime.now().strftime("%H:%M:%S.%f")[:-4]
+        print(f"{self.profile_name} {now} {txt}")
 
+    def log_op(self, operation, path1, path2=None):
+
+        def abbrev_path(path, root):
+            root_length = len(root.split(os.sep))
+            path_length = len(path.split(os.sep))
+            if path_length - 3 > root_length:
+                return f'{root}/.../{basename(path)}'
+            else:
+                return path
+
+        if 'ploaded' in operation:
+            src = path1 if SHOW_FULL_PATH else os.path.relpath(path1, start=self.local_folder)
+        else:
+            src = path1 if SHOW_FULL_PATH else os.path.relpath(path1, start=self.remote_dir)
+        if path2:
+            dest = path2 if SHOW_FULL_PATH else os.path.relpath(path2, start=self.remote_dir)
+            # abbrev_path(path2, self.remote_dir)
+            txt = f"{src} -> {dest}"
+        else:
+            txt = f"{src}"
+        # now = datetime.now().strftime("%d %b %H:%M:%S.%f")[:-4]
+        self.log(f"{operation}: {txt}")
+
+    def upload(self, src_path):
         def do_upload(src_path, remote_path):
             try:
-                # just upload the file, don't bother checking if remote dir exists
                 with open(src_path, 'rb') as f:
                     self.ftps.storbinary(f'STOR {remote_path}', f)
-                    print(f"Uploaded: {src_path} -> {remote_path} at {time.ctime()}")
+                    self.log_op("Uploaded", src_path, remote_path)
                     return True
             except error_perm:
-                # oops, guess it doesn't exist, better make it
                 if self.make_dir(os.path.dirname(src_path)):
                     return do_upload(src_path, remote_path)
                 else:
                     return False
             except (FileNotFoundError, PermissionError, OSError) as e:
-                print(f"File error: {e}")
+                self.log(f"File error: {e}")
                 return False
 
         remote_path = self.get_remote_path(src_path)
         return self.do_op(do_upload, 'upload', src_path, remote_path)
 
     def delete_file(self, src_path):
-
         def do_delete_file(remote_path):
             self.ftps.delete(remote_path)
-            print(f"Deleted: {remote_path} at {time.ctime()}")
+            self.log_op("Deleted", remote_path)
             return True
 
         remote_path = self.get_remote_path(src_path)
         return self.do_op(do_delete_file, 'delete', remote_path)
 
     def rename(self, src_path, dest_path, op='rename'):
-
         def do_rename(remote_path, remote_dest_path):
             self.ftps.rename(remote_path, remote_dest_path)
-            print(f"{op.capitalize()}d: {remote_path} to {remote_dest_path} at {time.ctime()}")
+            self.log_op(f"{op.capitalize()}d", remote_path, remote_dest_path)
             return True
 
         remote_path = self.get_remote_path(src_path)
@@ -263,18 +257,15 @@ class FTPSHandler:
         return self.do_op(do_rename, op, remote_path, remote_dest_path)
 
     def move(self, src_path, dest_path):
-        """move file or dir"""
         if self.make_dir(os.path.dirname(dest_path)):
             return self.rename(src_path, dest_path, op='move')
         else:
             return False
 
     def make_dir(self, src_path):
-
         def do_make_dir(remote_path):
-            self.ftps.cwd(self.remote_dir)  # change to root folder
+            self.ftps.cwd(self.remote_dir)
             relative_path = os.path.relpath(remote_path, start=self.remote_dir)
-            # ASSume FTP uses unix path
             dirs = relative_path.split('/')
             for dir in dirs:
                 if dir:
@@ -282,7 +273,7 @@ class FTPSHandler:
                         self.ftps.cwd(dir)
                     except Exception:
                         self.ftps.mkd(dir)
-                        print(f"Created directory {dir}.")
+                        self.log_op("Created", os.path.join(self.remote_dir, relative_path))
                         self.ftps.cwd(dir)
             return True
 
@@ -290,7 +281,6 @@ class FTPSHandler:
         return self.do_op(do_make_dir, 'mkdir', remote_path)
 
     def delete_dir(self, src_path):
-
         def do_delete_dir(path):
             counts = defaultdict(lambda: {'success': 0, 'failure': 0, 'ignored': 0})
 
@@ -309,17 +299,17 @@ class FTPSHandler:
                         try:
                             self.ftps.delete(full_path)
                             counts['delete']['success'] += 1
-                            print(f'Deleted: {full_path}')
+                            self.log_op("Deleted", os.path.join(self.remote_dir, os.path.relpath(full_path, start=self.remote_dir)))
                         except Exception as e:
                             counts['delete']['failure'] += 1
-                            print(f"Unable to delete {full_path}: {e}")
+                            self.log(f"Unable to delete {full_path}: {e}")
 
                 self.ftps.rmd(path)
                 counts['rmdir']['success'] += 1
-                print(f'Removed: {path}')
+                self.log_op("Removed", path)
             except error_perm as e:
                 counts['rmdir']['failure'] += 1
-                print(f"Unable to delete {path}: {e}")
+                self.log(f"Unable to delete {path}: {e}")
 
             return counts
 
@@ -505,10 +495,10 @@ def get_files_to_sync(profile, modified_since):
     return files_to_sync
 
 
-def manual_sync(profile, modified_since, sync=False):
+def manual_sync(profile, modified_since, execute=False):
     files_to_sync = get_files_to_sync(profile, modified_since)
 
-    if not sync:
+    if not execute:
         print(f"Files that would be uploaded:")
         for file in files_to_sync:
             if profile['ignore_regex'] is None or profile['ignore_regex'].search(file) is None:
@@ -523,7 +513,7 @@ def manual_sync(profile, modified_since, sync=False):
     for file_path in files_to_sync:
         queue.put(FileOperation('upload', file_path, batch_id=1))
 
-    queue_handler = QueueHandler(queue, ftps_handler, profile.ignore_regex)
+    queue_handler = QueueHandler(queue, ftps_handler, profile.get('ignore_regex'))
     queue_thread = Thread(target=queue_handler.process_queue)
     queue_thread.daemon = True
     queue_thread.start()
@@ -569,9 +559,9 @@ if __name__ == "__main__":
             time_delta = parse_time_string(args.modified)
             modified_since = datetime.now() - time_delta
             for profile in profiles.values():
-                mode = 'Manually syncing' if args.sync else 'Previewing'
+                mode = 'Manually syncing' if args.execute else 'Previewing'
                 print(f"\n{mode} profile {profile['name']}: {profile['local']} -> {profile['remote']}")
-                manual_sync(profile, modified_since.timestamp(), args.sync)
+                manual_sync(profile, modified_since.timestamp(), args.execute)
         except Exception as e:
             print(f"{e}")
             sys.exit(1)

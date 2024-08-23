@@ -5,3 +5,4 @@
 *.ini
 __pycache__/
 *.sublime*
+.vscode/
