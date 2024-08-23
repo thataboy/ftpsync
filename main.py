@@ -38,9 +38,8 @@ class FileOperation:
 
 
 class FileMonitorHandler(FileSystemEventHandler):
-    def __init__(self, queue, ignore_regex):
+    def __init__(self, queue):
         self.queue = queue
-        self.ignore_regex = ignore_regex
 
         # FileSystemEvents are low level file operations, like "dir created" or "file modified"
         # rather than "copy folder A to B"
@@ -63,9 +62,6 @@ class FileMonitorHandler(FileSystemEventHandler):
             'rename': ['rename'],
             'move': ['mkdir', 'move']  # not sure about this one?
         }
-
-    def should_process(self, src_path):
-        return self.ignore_regex is None or self.ignore_regex.search(src_path) is None
 
     def is_new_batch(self, operation, src_path, current_time):
         if self.last_operation is None:
@@ -93,7 +89,7 @@ class FileMonitorHandler(FileSystemEventHandler):
         self.queue.put(FileOperation(operation, src_path, dest_path, batch_id=self.batch_id))
 
     def on_modified(self, event):
-        if not event.is_directory and self.should_process(event.src_path):
+        if not event.is_directory:
             try:
                 stat_result = os.stat(event.src_path)
             except Exception:
@@ -106,22 +102,19 @@ class FileMonitorHandler(FileSystemEventHandler):
                 self.queue_operation('upload', event.src_path)
 
     def on_created(self, event):
-        if self.should_process(event.src_path):
-            op = 'mkdir' if event.is_directory else 'upload'
-            self.queue_operation(op, event.src_path)
+        op = 'mkdir' if event.is_directory else 'upload'
+        self.queue_operation(op, event.src_path)
 
     def on_deleted(self, event):
         if not SYNC_FOLDER_DELETION and event.is_directory or \
-           not SYNC_FILE_DELETION and not event.is_directory or \
-           not self.should_process(event.src_path):
+           not SYNC_FILE_DELETION and not event.is_directory:
             return
         op = 'rmdir' if event.is_directory else 'delete'
         self.queue_operation(op, event.src_path)
 
     def on_moved(self, event):
         if not SYNC_FOLDER_MOVE and event.is_directory or \
-           not SYNC_FILE_MOVE and not event.is_directory or \
-           not self.should_process(event.src_path):
+           not SYNC_FILE_MOVE and not event.is_directory:
             return
         # check if parent dir still exist,
         # in case system is generating a moved event for child items
@@ -138,6 +131,7 @@ class FTPSHandler:
         self.ftp_pwd = decrypt(profile['pwd']) if ENCRYPT_PASSWORD else profile['password']
         self.remote_dir = profile['remote']
         self.local_folder = profile['local']
+        self.profile_name = profile['name']
         self.ftps = None
         self.errors = set()
         self.max_retries = MAX_RETRIES
@@ -298,7 +292,7 @@ class FTPSHandler:
     def delete_dir(self, src_path):
 
         def do_delete_dir(path):
-            counts = defaultdict(lambda: {'success': 0, 'failure': 0})
+            counts = defaultdict(lambda: {'success': 0, 'failure': 0, 'ignored': 0})
 
             try:
                 listing = self.ftps.mlsd(path, facts=['type'])
@@ -335,7 +329,7 @@ class FTPSHandler:
 
 class BatchTracker:
     def __init__(self):
-        self.counts = defaultdict(lambda: {'success': 0, 'failure': 0})
+        self.counts = defaultdict(lambda: {'success': 0, 'failure': 0, 'ignored': 0})
         self.start_time = time.time()
 
     def record(self, operation, success):
@@ -349,26 +343,34 @@ class BatchTracker:
                 for res in ['success', 'failure']:
                     self.counts[op][res] += counts[res]
                     self.counts['total'][res] += counts[res]
+        elif success is None:
+            self.counts[operation]['ignored'] += 1
+            self.counts['total']['ignored'] += 1
 
     def report(self):
         if self.counts['total']['success'] + self.counts['total']['failure'] > 1:
             print("\nBatch Summary:")
             total = self.counts.pop('total')
             for op, counts in self.counts.items():
-                print(f"{op.capitalize()}: {counts['success']} successful, {counts['failure']} failed")
-            print(f"Total: {total['success']} successful, {total['failure']} failed")
+                print(f"{op.capitalize()}: {counts['success']} successful, "
+                      f"{counts['failure']} failed, {counts['ignored']} ignored")
+            print(f"Total: {total['success']} successful, {total['failure']} failed, {total['ignored']} ignored")
 
             duration = time.time() - self.start_time
             print(f"Batch duration: {duration:.2f} seconds")
 
 
 class QueueHandler:
-    def __init__(self, queue, ftps_handler):
+    def __init__(self, queue, ftps_handler, ignore_regex):
         self.queue = queue
         self.ftps_handler = ftps_handler
         self.stop_event = Event()
         self.current_batch_id = None
         self.batch_tracker = None
+        self.ignore_regex = ignore_regex
+
+    def should_process(self, src_path):
+        return self.ignore_regex is None or self.ignore_regex.search(src_path) is None
 
     def process_queue(self):
         while not self.stop_event.is_set():
@@ -382,7 +384,10 @@ class QueueHandler:
                     self.batch_tracker = BatchTracker()
                     print()
 
-                success = self.process_operation(operation)
+                if self.should_process(operation.src_path):
+                    success = self.process_operation(operation)
+                else:
+                    success = None
                 self.batch_tracker.record(operation.operation, success)
 
                 self.queue.task_done()
@@ -426,9 +431,9 @@ def start_monitor(profiles):
 
         queue = Queue()
         ftps_handler = FTPSHandler(profile)
-        event_handler = FileMonitorHandler(queue, ignore_regex)
+        event_handler = FileMonitorHandler(queue)
 
-        queue_handler = QueueHandler(queue, ftps_handler)
+        queue_handler = QueueHandler(queue, ftps_handler, ignore_regex)
         queue_thread = Thread(target=queue_handler.process_queue)
         queue_thread.daemon = True
         queue_thread.start()
@@ -495,9 +500,8 @@ def get_files_to_sync(profile, modified_since):
     for root, _, files in os.walk(profile['local']):
         for file in files:
             file_path = os.path.join(root, file)
-            if profile['ignore_regex'] is None or profile['ignore_regex'].search(file_path) is None:
-                if os.path.getmtime(file_path) > modified_since:
-                    files_to_sync.append(file_path)
+            if os.path.getmtime(file_path) > modified_since:
+                files_to_sync.append(file_path)
     return files_to_sync
 
 
@@ -507,7 +511,10 @@ def manual_sync(profile, modified_since, sync=False):
     if not sync:
         print(f"Files that would be uploaded:")
         for file in files_to_sync:
-            print(f"  {file}")
+            if profile['ignore_regex'] is None or profile['ignore_regex'].search(file) is None:
+                print(f"  {file}")
+            else:
+                print(f"  Ignored: {file}")
         return
 
     queue = Queue()
@@ -516,7 +523,7 @@ def manual_sync(profile, modified_since, sync=False):
     for file_path in files_to_sync:
         queue.put(FileOperation('upload', file_path, batch_id=1))
 
-    queue_handler = QueueHandler(queue, ftps_handler)
+    queue_handler = QueueHandler(queue, ftps_handler, profile.ignore_regex)
     queue_thread = Thread(target=queue_handler.process_queue)
     queue_thread.daemon = True
     queue_thread.start()
@@ -530,10 +537,11 @@ def manual_sync(profile, modified_since, sync=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FTP Sync Tool")
     parser.add_argument('profiles', nargs='+',
-                        help='Profile(s) to monitor or sync. Or all = all profiles; ALL = all profiles, including disabled ones')
+                        help='Profile(s) to monitor or sync. Or all = all profiles; '
+                             'ALL = all profiles, including disabled ones')
     parser.add_argument("-m", "--modified",
                         help="Sync files modified within <integer><time_unit> (e.g.: 30d | 12h | 15m | 30s)")
-    parser.add_argument("-s", "--sync", action="store_true", help="Sync files (by default, only a preview is shown)")
+    parser.add_argument("-x", "--execute", action="store_true", help="Execute sync (by default, only show a preview)")
 
     args = parser.parse_args()
 
@@ -541,8 +549,8 @@ if __name__ == "__main__":
         print(f'all, ALL, and profile(s) may not be used together.')
         sys.exit(1)
 
-    if args.sync and not args.modified:
-        print("-s (--sync) requires the -m (--modified) option. Please specify a time range.")
+    if args.execute and not args.modified:
+        print("-x (--execute) requires the -m (--modified) option. Please specify a time range.")
         sys.exit(1)
 
     ini_path = os.path.join(os.path.dirname(__file__), 'ftpsync.ini')

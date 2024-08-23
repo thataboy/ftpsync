@@ -133,7 +133,7 @@ python main.py all
 
 - Sync all files in mars.espresso.prod that have been changed in last 12h
 ```
-python main.py -m 12h -s mars.espresso.prod
+python main.py --modified 12h --execute mars.espresso.prod
 ```
 
 ### Help
@@ -152,7 +152,7 @@ options:
   -h, --help            show this help message and exit
   -m MODIFIED, --modified MODIFIED
                         Sync files modified within <integer><time_unit> (e.g.: 30d | 12h | 15m | 30s)
-  -s, --sync            Sync files (by default, only a preview is shown)
+  -x, --execute         Execute sync (by default, only show a preview)
 ```
 
 ## Additional Notes
