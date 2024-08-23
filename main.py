@@ -29,64 +29,106 @@ class FtpError(Enum):
 
 
 class FileOperation:
-    def __init__(self, operation, src_path, dest_path=None):
+    def __init__(self, operation, src_path, dest_path=None, batch_id=0):
         self.operation = operation
         self.src_path = src_path
         self.dest_path = dest_path
+        self.batch_id = batch_id
+        self.timestamp = time.time()
 
 
 class FileMonitorHandler(FileSystemEventHandler):
-
     def __init__(self, queue, ignore_regex):
         self.queue = queue
         self.ignore_regex = ignore_regex
 
+        # FileSystemEvents are low level file operations, like "dir created" or "file modified"
+        # rather than "copy folder A to B"
+        # FileMonitorHandler tries to group them into batches in order to show
+        # meaningful summaries like nnn files uploaded
+        # It does this by looking at the time when the event is fired and other heuristics
+        self.batch_id = 0  # each batch is given an id
+        self.base_dir = None  # dir name of the first src_path in the batch
+        self.last_operation = None
+        self.last_operation_time = None
+        self.time_threshold = 1.0
+        self.short_time_threshold = 0.05
+        self.long_time_threshold = 10.0
+        # operation(s) that may be expected to follow a given operation
+        self.compatible_operations = {
+            'mkdir': ['mkdir', 'upload'],
+            'upload': ['upload', 'mkdir'],
+            'delete': ['delete', 'rmdir'],
+            'rmdir': ['rmdir', 'delete'],
+            'rename': ['rename'],
+            'move': ['mkdir', 'move']  # not sure about this one?
+        }
+
     def should_process(self, src_path):
         return self.ignore_regex is None or self.ignore_regex.search(src_path) is None
 
+    def is_new_batch(self, operation, src_path, current_time):
+        if self.last_operation is None:
+            return True
+        diff = current_time - self.last_operation_time
+        if diff <= self.short_time_threshold:
+            return False
+        if operation not in self.compatible_operations.get(self.last_operation, []):
+            return True
+        if diff >= self.long_time_threshold:
+            return True
+        if diff >= self.time_threshold and self.base_dir not in src_path:
+            return True
+        return False
+
+    def queue_operation(self, operation, src_path, dest_path=None):
+        current_time = time.time()
+        if self.is_new_batch(operation, src_path, current_time):
+            self.base_dir = os.path.dirname(src_path)
+            self.batch_id += 1
+
+        self.last_operation = operation
+        self.last_operation_time = current_time
+
+        self.queue.put(FileOperation(operation, src_path, dest_path, batch_id=self.batch_id))
+
     def on_modified(self, event):
-        # print(f'{event}')
         if not event.is_directory and self.should_process(event.src_path):
-            # when you duplicate a file, Mac generates a FileCreatedEvent
-            # and FileModifiedEvent in quick succession, causing duplicate upload
             try:
                 stat_result = os.stat(event.src_path)
             except Exception:
                 return
             ctime = stat_result.st_ctime
             mtime = stat_result.st_mtime
+            # when duplicating in Finder, it generates a created followed immediately by modified event
+            # this check prevents double uploads
             if mtime - ctime > 0.05:
-                self.queue.put(FileOperation('upload', event.src_path))
+                self.queue_operation('upload', event.src_path)
 
     def on_created(self, event):
-        # print(f'{event}')
         if self.should_process(event.src_path):
             op = 'mkdir' if event.is_directory else 'upload'
-            self.queue.put(FileOperation(op, event.src_path))
+            self.queue_operation(op, event.src_path)
 
     def on_deleted(self, event):
-        # print(f'{event}')
         if not SYNC_FOLDER_DELETION and event.is_directory or \
            not SYNC_FILE_DELETION and not event.is_directory or \
            not self.should_process(event.src_path):
             return
         op = 'rmdir' if event.is_directory else 'delete'
-        self.queue.put(FileOperation(op, event.src_path))
+        self.queue_operation(op, event.src_path)
 
     def on_moved(self, event):
         if not SYNC_FOLDER_MOVE and event.is_directory or \
            not SYNC_FILE_MOVE and not event.is_directory or \
            not self.should_process(event.src_path):
             return
-        # when you rename/move a folder, Mac seems to send a DirMovedEvent
-        # followed by a FileMovedEvent for all the files in the folder, too
-        # so we have to check to see if parent folder is still there
-        # to prevent lots of errors when moving non existent files on server
+        # check if parent dir still exist,
+        # in case system is generating a moved event for child items
         if not os.path.exists(os.path.dirname(event.src_path)):
             return
-        # moving to same folder => renaming
         op = 'rename' if os.path.dirname(event.src_path) == os.path.dirname(event.dest_path) else 'move'
-        self.queue.put(FileOperation(op, event.src_path, event.dest_path))
+        self.queue_operation(op, event.src_path, event.dest_path)
 
 
 class FTPSHandler:
@@ -229,7 +271,9 @@ class FTPSHandler:
     def move(self, src_path, dest_path):
         """move file or dir"""
         if self.make_dir(os.path.dirname(dest_path)):
-            self.rename(src_path, dest_path, op='move')
+            return self.rename(src_path, dest_path, op='move')
+        else:
+            return False
 
     def make_dir(self, src_path):
 
@@ -243,14 +287,13 @@ class FTPSHandler:
                     try:
                         self.ftps.cwd(dir)
                     except Exception:
-                        print(f"Creating directory {dir}.")
                         self.ftps.mkd(dir)
+                        print(f"Created directory {dir}.")
                         self.ftps.cwd(dir)
             return True
 
         remote_path = self.get_remote_path(src_path)
         return self.do_op(do_make_dir, 'mkdir', remote_path)
-
 
     def delete_dir(self, src_path):
 
@@ -287,65 +330,27 @@ class FTPSHandler:
             return counts
 
         remote_path = self.get_remote_path(src_path)
-        counts = self.do_op(do_delete_dir, 'rmdir', remote_path)
-        if counts:
-            for item in ['success', 'failure']:
-                counts['total'][item] = counts['rmdir'][item] + counts['delete'][item]
-        return counts
+        return self.do_op(do_delete_dir, 'rmdir', remote_path)
 
 
 class BatchTracker:
-    def __init__(self, time_threshold=1.0, path_levels=3):
+    def __init__(self):
         self.counts = defaultdict(lambda: {'success': 0, 'failure': 0})
-        self.last_operation = None
-        self.last_operation_time = None
-        self.last_src_path = None
-        self.time_threshold = time_threshold
-        self.path_levels = path_levels
-        self.batch_start_time = None
-        self.compatible_operations = {
-            'mkdir': ['mkdir', 'upload'],
-            'upload': ['upload', 'mkdir'],
-            'delete': ['delete', 'rmdir'],
-            'rmdir': [],
-            'rename': ['rename'],
-            'move': ['mkdir', 'move']
-        }
+        self.start_time = time.time()
 
-    def get_path_key(self, src_path):
-        parts = os.path.normpath(src_path).split(os.sep)
-        return os.sep.join(parts[:-self.path_levels])
-
-    def is_new_batch(self, operation, src_path, current_time):
-        if self.last_operation is None:
-            return True
-        if operation not in self.compatible_operations.get(self.last_operation, []):
-            return True
-        if current_time - self.last_operation_time > self.time_threshold:
-            return True
-        # if self.get_path_key(src_path) != self.get_path_key(self.last_src_path):
-        #     return True
-        return False
-
-    def record(self, operation, src_path, success):
-        current_time = time.time()
-
-        if self.is_new_batch(operation, src_path, current_time):
-            self.report()
-            self.batch_start_time = current_time
-
-        if operation != 'rmdir':
+    def record(self, operation, success):
+        if isinstance(success, bool):
             self.counts[operation]['success' if success else 'failure'] += 1
             self.counts['total']['success' if success else 'failure'] += 1
-
-        self.last_operation = operation
-        self.last_operation_time = current_time
-        self.last_src_path = src_path
+        elif isinstance(success, dict):
+            # rather than a single bool, operation 'rmdir' returns a dict of count of
+            # successful or failed 'rmdir' and 'delete' operations
+            for op, counts in success.items():
+                for res in ['success', 'failure']:
+                    self.counts[op][res] += counts[res]
+                    self.counts['total'][res] += counts[res]
 
     def report(self):
-        if self.batch_start_time is None:
-            return
-
         if self.counts['total']['success'] + self.counts['total']['failure'] > 1:
             print("\nBatch Summary:")
             total = self.counts.pop('total')
@@ -353,11 +358,8 @@ class BatchTracker:
                 print(f"{op.capitalize()}: {counts['success']} successful, {counts['failure']} failed")
             print(f"Total: {total['success']} successful, {total['failure']} failed")
 
-            duration = time.time() - self.batch_start_time
+            duration = time.time() - self.start_time
             print(f"Batch duration: {duration:.2f} seconds")
-
-        self.counts.clear()
-        self.batch_start_time = None
 
 
 class QueueHandler:
@@ -365,44 +367,53 @@ class QueueHandler:
         self.queue = queue
         self.ftps_handler = ftps_handler
         self.stop_event = Event()
-        self.batch_tracker = BatchTracker()
-        self.is_empty = True
+        self.current_batch_id = None
+        self.batch_tracker = None
 
     def process_queue(self):
         while not self.stop_event.is_set():
             try:
                 operation = self.queue.get(timeout=1)
-                success = False
-                if self.is_empty:
-                    self.is_empty = False
-                    print()
-                if operation.operation == 'upload':
-                    success = self.ftps_handler.upload(operation.src_path)
-                elif operation.operation == 'delete':
-                    success = self.ftps_handler.delete_file(operation.src_path)
-                elif operation.operation == 'mkdir':
-                    success = self.ftps_handler.make_dir(operation.src_path)
-                elif operation.operation == 'rmdir':
-                    # rmdir does a pseudo record to start a new batch
-                    self.batch_tracker.record('rmdir', '', None)
-                    self.batch_tracker.counts = self.ftps_handler.delete_dir(operation.src_path)
-                    self.batch_tracker.report()
-                elif operation.operation == 'rename':
-                    success = self.ftps_handler.rename(operation.src_path, operation.dest_path)
-                elif operation.operation == 'move':
-                    success = self.ftps_handler.move(operation.src_path, operation.dest_path)
 
-                if operation.operation != 'rmdir':
-                    self.batch_tracker.record(operation.operation, operation.src_path, success)
+                if self.current_batch_id != operation.batch_id:
+                    if self.batch_tracker:
+                        self.batch_tracker.report()
+                    self.current_batch_id = operation.batch_id
+                    self.batch_tracker = BatchTracker()
+                    print()
+
+                success = self.process_operation(operation)
+                self.batch_tracker.record(operation.operation, success)
+
                 self.queue.task_done()
+
             except Empty:
-                self.batch_tracker.report()  # Report any remaining operations
-                self.is_empty = True
+                if self.batch_tracker:
+                    self.batch_tracker.report()
+                    self.batch_tracker = None
+                self.current_batch_id = None
                 continue
+
+    def process_operation(self, operation):
+        success = False
+        if operation.operation == 'upload':
+            success = self.ftps_handler.upload(operation.src_path)
+        elif operation.operation == 'delete':
+            success = self.ftps_handler.delete_file(operation.src_path)
+        elif operation.operation == 'mkdir':
+            success = self.ftps_handler.make_dir(operation.src_path)
+        elif operation.operation == 'rmdir':
+            success = self.ftps_handler.delete_dir(operation.src_path)
+        elif operation.operation == 'rename':
+            success = self.ftps_handler.rename(operation.src_path, operation.dest_path)
+        elif operation.operation == 'move':
+            success = self.ftps_handler.move(operation.src_path, operation.dest_path)
+        return success
 
     def stop(self):
         self.stop_event.set()
-        self.batch_tracker.report()  # Final report when stopping
+        if self.batch_tracker:
+            self.batch_tracker.report()
 
 
 def start_monitor(profiles):
@@ -503,7 +514,7 @@ def manual_sync(profile, modified_since, sync=False):
     ftps_handler = FTPSHandler(profile)
 
     for file_path in files_to_sync:
-        queue.put(FileOperation('upload', file_path))
+        queue.put(FileOperation('upload', file_path, batch_id=1))
 
     queue_handler = QueueHandler(queue, ftps_handler)
     queue_thread = Thread(target=queue_handler.process_queue)
