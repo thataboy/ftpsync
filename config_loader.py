@@ -85,7 +85,7 @@ def lint_profile(name, profile, bad_regexes):
             return False
 
     missing = REQUIRED_VALUES.difference(profile.keys())
-    if len(missing) > 0:
+    if missing:
         # root section is expected to have missing values, that's normal
         # if name != ROOT_NAME:
         #     print(f'Warning: {name} is missing {missing}. Skipping.')
@@ -95,11 +95,30 @@ def lint_profile(name, profile, bad_regexes):
     if local.startswith('~'):
         local = os.path.expanduser(local)
         profile['local'] = local
+    local = os.path.normpath(os.path.abspath(local))
     if not os.path.isdir(local):
         print(f'Error: {name} has invalid local folder {local}. Skipping.')
         return False
+    profile['local'] = local
 
     return True
+
+
+def filter_superseded(profiles):
+    """filter out profiles whose local path is child of some other profile's local path"""
+    childs = set()
+    for name, profile in profiles.items():
+        for name2, profile2 in profiles.items():
+            if name == name2 or name in childs or name2 in childs:
+                continue
+            if profile['local'].startswith(profile2['local']):
+                child = name2 if len(profile2['local']) > len(profile['local']) else name
+                parent = name if child == name2 else name2
+                print(f"Warning: {profiles[child]['name']} {profiles[child]['local']} "
+                      f"is superceded by {profiles[parent]['name']} {profiles[parent]['local']}. Skipping.")
+                childs.add(child)
+    return profiles if not childs else {name: profile for name, profile in profiles.items()
+                                        if name not in childs}
 
 
 def load_config(file_path, argv):
@@ -134,7 +153,7 @@ def load_config(file_path, argv):
         found = set()
         config.walk(mark_wanted, call_on_sections=True, wanted=wanted, found=found)
         wanted -= found
-        if len(wanted) > 0:
+        if wanted:
             print(f'Warning: Unknown profile(s) {wanted}')
 
     config.walk(cascade_values, call_on_sections=True)
@@ -148,4 +167,4 @@ def load_config(file_path, argv):
 
     # print(profiles)
     # exit()
-    return profiles
+    return filter_superseded(profiles)
