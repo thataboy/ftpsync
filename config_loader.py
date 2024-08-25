@@ -3,8 +3,8 @@ from crypty import encrypt
 import re
 import os
 import sys
+from constants import ENCRYPT_PASSWORD
 
-ENCRYPT_PASSWORD = True
 REQUIRED_VALUES = {
     "host",
     "user",
