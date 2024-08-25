@@ -2,6 +2,7 @@ import os
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from ftplib import FTP_TLS, error_perm
+from socket import gaierror
 import time
 from queue import Queue, Empty
 from threading import Thread, Event
@@ -18,12 +19,6 @@ logging.basicConfig(level=logging.INFO,
                     datefmt='%H:%M:%S')
 
 logger = logging.getLogger(' ')
-
-
-class FtpError(Enum):
-    NO_AUTHENTICATION = 1
-    NO_SUCH_FILE_OR_DIR = 2
-    OTHER = 9
 
 
 class FileOperation:
@@ -151,20 +146,15 @@ class FTPSHandler:
         if self.ftps:
             return True
 
-        def do_connect():
-            try:
-                self.ftps = FTP_TLS(self.ftp_host)
-                self.ftps.login(self.ftp_user, self.ftp_pwd)
-                self.ftps.prot_p()
-                return True
-            except error_perm as e:
-                self.errors.add(FtpError.NO_AUTHENTICATION)
-                self.logger.error(f"Cannot connect to {self.ftp_host}: {e}")
-                self.logger.critical("Authentication failed. Stopping this profile.")
-                self.is_active = False
-                return False
+        def do_connect(name):
+            self.logger.info(f'Connecting to {name}..')
+            self.ftps = FTP_TLS(self.ftp_host)
+            self.ftps.login(self.ftp_user, self.ftp_pwd)
+            self.ftps.prot_p()
+            return True
 
-        return self.do_op(do_connect, 'connect')
+        name = f'{self.ftp_user}@{self.ftp_host}'
+        return self.do_op(do_connect, 'connect', name, log_success=False)
 
     def disconnect(self):
         if self.ftps:
@@ -175,28 +165,39 @@ class FTPSHandler:
             finally:
                 self.ftps = None
 
-    def do_op(self, func, op_name, *args, **kwargs):
-        if FtpError.NO_AUTHENTICATION in self.errors:
+    def do_op(self, func, op_name, *args, log_success=True, **kwargs):
+        if not self.is_active:
             return False
 
         for attempt in range(FTP_MAX_RETRIES):
+
             if op_name != 'connect' and not self.connect():
                 return False
+
+            if len(args) > 1:
+                args_str = f"{args[0]} -> {args[1]}"
+            elif len(args) == 1:
+                args_str = args[0]
+            else:
+                args_str = ''
             try:
-                return func(*args, **kwargs)
-            except (error_perm, Exception) as e:
-                if len(args) > 1:
-                    txt = f"{args[0]} -> {args[1]}"
-                elif len(args) == 1:
-                    txt = args[0]
-                else:
-                    txt = ''
-                perm = isinstance(e, error_perm)
+                res = func(*args, **kwargs)
+                if res and log_success:
+                    verb = f"{op_name.capitalize()}{'d' if op_name.endswith('e') else 'ed'}"
+                    self.logger.info(f"{verb}: {args_str}")
+                return res
+            except Exception as e:
+                perm = isinstance(e, (error_perm, gaierror))
+                if perm and op_name == 'connect':
+                    self.logger.error(f"Failed to connect to {args_str}: {e}")
+                    self.logger.critical("Permanent error. Stopping this profile.")
+                    self.is_active = False
+                    return False
                 if perm or attempt >= FTP_MAX_RETRIES - 1:
                     quit = '' if perm else f'Gave up after {FTP_MAX_RETRIES} attempts.'
-                    self.logger.error(f"Failed to {op_name} {txt}: {e}. {quit}")
+                    self.logger.error(f"Failed to {op_name} {args_str}: {e}. {quit}")
                     return False
-                self.logger.warning(f"Unable to {op_name} {txt}: {e}. Retrying in {FTP_RETRY_DELAY} seconds...")
+                self.logger.warning(f"Unable to {op_name} {args_str}: {e}. Retrying in {FTP_RETRY_DELAY} seconds...")
                 self.disconnect()
                 time.sleep(FTP_RETRY_DELAY)
 
@@ -210,7 +211,6 @@ class FTPSHandler:
             try:
                 with open(src_path, 'rb') as f:
                     self.ftps.storbinary(f'STOR {remote_path}', f)
-                    self.logger.info(f"Uploaded: {src_path} -> {remote_path}")
                     return True
             except error_perm:
                 if self.make_dir(os.path.dirname(src_path)):
@@ -227,7 +227,6 @@ class FTPSHandler:
     def delete_file(self, src_path):
         def do_delete_file(remote_path):
             self.ftps.delete(remote_path)
-            self.logger.info(f"Deleted: {remote_path}")
             return True
 
         remote_path = self.get_remote_path(src_path)
@@ -236,7 +235,6 @@ class FTPSHandler:
     def rename(self, src_path, dest_path, op='rename'):
         def do_rename(remote_path, remote_dest_path):
             self.ftps.rename(remote_path, remote_dest_path)
-            self.logger.info(f"{op.capitalize()}d: {remote_path} -> {remote_dest_path}")
             return True
 
         remote_path = self.get_remote_path(src_path)
@@ -265,7 +263,7 @@ class FTPSHandler:
             return True
 
         remote_path = self.get_remote_path(src_path)
-        return self.do_op(do_make_dir, 'mkdir', remote_path)
+        return self.do_op(do_make_dir, 'mkdir', remote_path, log_success=False)
 
     def delete_dir(self, src_path):
         def do_delete_dir(path):
@@ -301,7 +299,7 @@ class FTPSHandler:
             return counts
 
         remote_path = self.get_remote_path(src_path)
-        return self.do_op(do_delete_dir, 'rmdir', remote_path)
+        return self.do_op(do_delete_dir, 'rmdir', remote_path, log_success=False)
 
 
 class BatchTracker:
