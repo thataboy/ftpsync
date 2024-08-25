@@ -58,8 +58,10 @@ class FileMonitorHandler(FileSystemEventHandler):
         self.batch_id = 0  # each batch is given an id
         self.base_dir = None  # dir name of the first src_path in the batch
         self.last_operation = None
+        self.last_operation_src = None
         self.last_operation_time = None
         self.time_threshold = 1.0
+        self.micro_time_threshold = 0.02
         self.short_time_threshold = 0.05
         self.long_time_threshold = 10.0
         # operation(s) that may be expected to follow a given operation
@@ -95,19 +97,25 @@ class FileMonitorHandler(FileSystemEventHandler):
             self.batch_id += 1
 
         self.last_operation = operation
+        self.last_operation_src = src_path
         self.last_operation_time = current_time
 
         self.queue.put(FileOperation(operation, src_path, dest_path, batch_id=self.batch_id))
 
+    def on_created(self, event):
+        op = 'mkdir' if event.is_directory else 'upload'
+        self.queue_operation(op, event.src_path)
+
     def on_modified(self, event):
         if not event.is_directory:
-            self.queue_operation('upload', event.src_path)
-
-    def on_created(self, event):
-        # there seems no need to check for file created event
-        # since it will be followed by file modified. This simplifies things
-        if event.is_directory:
-            self.queue_operation('mkdir', event.src_path)
+            # check for file modified event right after file created event
+            # to avoid duplicate uploads. This seems to happen when
+            # user duplicates file(s) in Finder
+            if self.last_operation_time and \
+               self.last_operation != 'upload' and \
+               self.last_operation_src != event.src_path and \
+               time.time() - self.last_operation_time > self.micro_time_threshold:
+                self.queue_operation('upload', event.src_path)
 
     def on_deleted(self, event):
         if not SYNC_FOLDER_DELETION and event.is_directory or \
