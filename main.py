@@ -11,7 +11,6 @@ from start_up import load_settings
 from constants import *
 from collections import defaultdict
 import logging
-from enum import Enum
 
 # Set up logging
 logging.basicConfig(level=logging.INFO,
@@ -132,9 +131,10 @@ class FTPSHandler:
         self.ftp_pwd = decrypt(profile['pwd']) if ENCRYPT_PASSWORD else profile['password']
         self.remote_dir = profile['remote']
         self.local_folder = profile['local']
-        self.ftps = None
+        self.ftps = FTP_TLS()
         self.errors = set()
-        self.is_active = True
+        self.is_connected = False
+        self.is_active = True  # set to False on permanent connect error. It's dead, Jim
         self.logger = logger
 
     def __del__(self):
@@ -143,27 +143,28 @@ class FTPSHandler:
     def connect(self):
         if not self.is_active:
             return False
-        if self.ftps:
+        if self.is_connected:
             return True
 
         def do_connect(name):
             self.logger.info(f'Connecting to {name}..')
-            self.ftps = FTP_TLS(self.ftp_host)
+            self.ftps.connect(self.ftp_host)
             self.ftps.login(self.ftp_user, self.ftp_pwd)
             self.ftps.prot_p()
+            self.is_connected = True
             return True
 
         name = f'{self.ftp_user}@{self.ftp_host}'
         return self.do_op(do_connect, 'connect', name, log_success=False)
 
     def disconnect(self):
-        if self.ftps:
+        if self.is_connected:
             try:
                 self.ftps.quit()
             except Exception:
                 pass
             finally:
-                self.ftps = None
+                self.is_connected = False
 
     def do_op(self, func, op_name, *args, log_success=True, **kwargs):
         if not self.is_active:
@@ -373,7 +374,8 @@ class QueueHandler:
                     success = self.process_operation(operation)
                 else:
                     success = None
-                self.batch_tracker.record(operation.operation, success)
+                if self.batch_tracker:
+                    self.batch_tracker.record(operation.operation, success)
 
                 self.queue.task_done()
 
