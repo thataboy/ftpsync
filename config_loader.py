@@ -164,7 +164,7 @@ def load_config(file_path, argv):
     bad_regexes = set()
     profiles = {name: profile for name, profile in profiles.items()
                 if lint_profile(name, profile, bad_regexes)}
+    profiles = filter_superseded(profiles)
 
-    # print(profiles)
-    # exit()
-    return filter_superseded(profiles)
+    print()
+    return profiles

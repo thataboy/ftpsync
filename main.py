@@ -11,13 +11,45 @@ from start_up import load_settings
 from constants import *
 from collections import defaultdict
 import logging
+import colorama
+
+
+# Initialize colorama
+colorama.init(autoreset=True)
+
+
+# Custom ColoredFormatter
+class ColoredFormatter(logging.Formatter):
+    COLORS = {
+        'DEBUG': colorama.Fore.BLUE,
+        'INFO': colorama.Fore.WHITE,
+        'WARNING': colorama.Fore.YELLOW,
+        'ERROR': colorama.Fore.RED,
+        'CRITICAL': colorama.Fore.RED
+    }
+
+    def format(self, record):
+        return (f"{colorama.Style.DIM}{self.formatTime(record, self.datefmt)}{colorama.Style.RESET_ALL} "
+                f"{self.COLORS.get(record.levelname, '')}{record.levelname}{colorama.Style.RESET_ALL} "
+                f"{colorama.Fore.MAGENTA}{record.name if record.name != 'root' else '>'} "
+                f"{colorama.Style.RESET_ALL}{record.msg}")
+
 
 # Set up logging
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s [%(levelname)s]%(name)s%(message)s',
-                    datefmt='%H:%M:%S')
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
+handler = logging.StreamHandler()
+formatter = ColoredFormatter(fmt='[%(levelname)s] %(name)s%(message)s', datefmt='%H:%M:%S')
+handler.setFormatter(formatter)
+logger.handlers = [handler]
 
-logger = logging.getLogger(' ')
+
+def colorize_path(path, base):
+    relative_path = os.path.relpath(path, start=base)
+    dirname, basename = os.path.split(relative_path)
+    return (f"{colorama.Style.DIM}{base}{os.path.sep if base else ''}{colorama.Style.RESET_ALL}"
+            f"{colorama.Fore.LIGHTCYAN_EX}{dirname}{os.path.sep if dirname else ''}"
+            f"{colorama.Fore.LIGHTMAGENTA_EX}{basename}{colorama.Style.RESET_ALL}")
 
 
 class FileOperation:
@@ -140,6 +172,14 @@ class FTPSHandler:
     def __del__(self):
         self.disconnect()
 
+    def log_success(self, operation, *paths):
+        (path, *rest) = paths
+        base = self.local_folder if operation == 'Uploaded' else self.remote_dir
+        path = colorize_path(path, base)
+        path2 = colorize_path(rest[0], self.remote_dir) if rest else None
+        txt = f'{path} -> {path2}' if path2 else path
+        self.logger.info(f"{colorama.Fore.GREEN}{operation}{colorama.Style.RESET_ALL}: {txt}")
+
     def connect(self):
         if not self.is_active:
             return False
@@ -185,7 +225,7 @@ class FTPSHandler:
                 res = func(*args, **kwargs)
                 if res and log_success:
                     verb = f"{op_name.capitalize()}{'d' if op_name.endswith('e') else 'ed'}"
-                    self.logger.info(f"{verb}: {args_str}")
+                    self.log_success(verb, *args)
                 return res
             except Exception as e:
                 perm = isinstance(e, (error_perm, gaierror))
@@ -259,7 +299,7 @@ class FTPSHandler:
                         self.ftps.cwd(dir)
                     except Exception:
                         self.ftps.mkd(dir)
-                        self.logger.info(f"Created: {os.path.join(self.remote_dir, relative_path)}")
+                        self.log_success('Created', os.path.join(self.remote_dir, relative_path))
                         self.ftps.cwd(dir)
             return True
 
@@ -285,14 +325,14 @@ class FTPSHandler:
                         try:
                             self.ftps.delete(full_path)
                             counts['delete']['success'] += 1
-                            self.logger.info(f"Deleted: {full_path}")
+                            self.log_success('Deleted', full_path)
                         except Exception as e:
                             counts['delete']['failure'] += 1
                             self.logger.error(f"Unable to delete {full_path}: {e}")
 
                 self.ftps.rmd(path)
                 counts['rmdir']['success'] += 1
-                self.logger.info(f"Removed: {path}")
+                self.log_success('Removed', path)
             except error_perm as e:
                 counts['rmdir']['failure'] += 1
                 self.logger.error(f"Unable to delete {path}: {e}")
@@ -327,16 +367,20 @@ class BatchTracker:
     def report(self):
         if self.counts['total']['success'] + self.counts['total']['failure'] > 1:
             print()
-            self.logger.info("Batch Summary:")
+            self.logger.info(f"{colorama.Fore.CYAN}Batch Summary:{colorama.Style.RESET_ALL}")
             total = self.counts.pop('total')
             for op, counts in self.counts.items():
-                self.logger.info(f"{op.capitalize()}: {counts['success']} successful, "
-                                 f"{counts['failure']} failed, {counts['ignored']} ignored")
-            self.logger.info(f"Total: {total['success']} successful, "
-                             f"{total['failure']} failed, {total['ignored']} ignored")
+                self.logger.info(f"{colorama.Fore.CYAN}{op.capitalize()}{colorama.Style.RESET_ALL}: "
+                                 f"{colorama.Fore.GREEN}{counts['success']} successful{colorama.Style.RESET_ALL}, "
+                                 f"{colorama.Fore.RED}{counts['failure']} failed{colorama.Style.RESET_ALL}, "
+                                 f"{colorama.Fore.YELLOW}{counts['ignored']} ignored{colorama.Style.RESET_ALL}")
+            self.logger.info(f"{colorama.Fore.CYAN}Total{colorama.Style.RESET_ALL}: "
+                             f"{colorama.Fore.GREEN}{total['success']} successful{colorama.Style.RESET_ALL}, "
+                             f"{colorama.Fore.RED}{total['failure']} failed{colorama.Style.RESET_ALL}, "
+                             f"{colorama.Fore.YELLOW}{total['ignored']} ignored{colorama.Style.RESET_ALL}")
 
             duration = time.time() - self.start_time
-            self.logger.info(f"Batch duration: {duration:.2f} seconds")
+            self.logger.info(f"{colorama.Fore.CYAN}Batch duration:{colorama.Style.RESET_ALL} {duration:.2f} seconds")
 
 
 class QueueHandler:
@@ -420,7 +464,7 @@ class SyncManager:
         self.local_folder = profile['local']
         self.remote_folder = profile['remote']
         self.ignore_regex = profile.get('ignore_regex')
-        self.logger = logging.getLogger(f' {profile['name']} ')
+        self.logger = logging.getLogger(self.name)
 
         self.queue = Queue()
         self.ftps_handler = FTPSHandler(profile, self.logger)
@@ -440,7 +484,7 @@ class SyncManager:
         self.observer.join(timeout=2)
         self.queue_handler.stop()
         self.ftps_handler.disconnect()
-        self.logger.info(f"Stopped monitoring")
+        self.logger.info("Stopped monitoring")
 
     @property
     def is_active(self):
@@ -482,7 +526,6 @@ def get_files_to_sync(local_folder, modified_since, ignore_regex):
 
 def manual_sync(profiles, modified_since, execute=False):
     for profile in profiles.values():
-        print()
         files_to_sync = get_files_to_sync(profile['local'], modified_since, profile['ignore_regex'])
 
         if not files_to_sync:
@@ -492,7 +535,7 @@ def manual_sync(profiles, modified_since, execute=False):
         if not execute:
             print(f"Preview for {profile['name']}:")
             for file in files_to_sync:
-                print(f"  {file}")
+                print(f"  {colorize_path(file, profile['local'])}")
             continue
 
         sync_manager = SyncManager(profile)
@@ -504,6 +547,7 @@ def manual_sync(profiles, modified_since, execute=False):
         sync_manager.queue.join()  # Wait for all tasks to be processed
         sync_manager.queue_handler.stop()
         sync_manager.ftps_handler.disconnect()
+        print()
 
 
 def monitor_profiles(profiles):
@@ -522,6 +566,7 @@ def monitor_profiles(profiles):
                 break
 
     except KeyboardInterrupt:
+        print()
         logger.info("Script interrupted")
     finally:
         clean_up(sync_managers)
@@ -534,5 +579,4 @@ if __name__ == "__main__":
     if args.modified:
         manual_sync(profiles, args.modified, args.execute)
     else:
-        print()
         monitor_profiles(profiles)

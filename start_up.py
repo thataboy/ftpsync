@@ -25,7 +25,6 @@ def load_settings():
        args.modified is None (monitor) or timedelta (manual sync)
        args.execute is bool True = perform sync, otherwise preview only
     """
-    print()
     parser = argparse.ArgumentParser(description="FTP Sync Tool")
     parser.add_argument('profiles', nargs='+',
                         help='Profile(s) to monitor or sync. Or all = all profiles; '

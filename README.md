@@ -32,6 +32,7 @@ The program works in two modes:
 - configobj
 - pycryptodome
 - watchdog
+- colorama
 
 ## Installation
 
@@ -42,7 +43,7 @@ The program works in two modes:
 
 2. Install the required dependencies:
    ```
-   pip install configobj watchdog crypty
+   pip install configobj pycryptodome watchdog colorama
    ```
 
 ## Configuration
