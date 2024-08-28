@@ -69,7 +69,7 @@ def gather_profiles(parent, key, take, profiles):
                                      if section.name else ROOT_NAME
 
 
-def lint_profile(name, profile, bad_regexes):
+def lint_profile(profile, bad_regexes):
     """does some basic validation
        returns True if profile is valid
        bad_regexes keep tracks of bad regexes to avoid duplicative warnings
@@ -80,7 +80,7 @@ def lint_profile(name, profile, bad_regexes):
         except Exception as e:
             if profile['ignore_regex'] not in bad_regexes:
                 bad_regexes.add(profile['ignore_regex'])
-                print(f"Error: {name} has bad regex:\n     {profile['ignore_regex']}\n{e}. Skipping")
+                print(f"Error: {profile['name']} has bad regex:\n     {profile['ignore_regex']}\n{e}. Skipping")
             # profile['ignore_regex'] = None
             return False
 
@@ -97,7 +97,7 @@ def lint_profile(name, profile, bad_regexes):
         profile['local'] = local
     local = os.path.normpath(os.path.abspath(local))
     if not os.path.isdir(local):
-        print(f'Error: {name} has invalid local folder {local}. Skipping.')
+        print(f'Error: {profile['name']} has invalid local folder {local}. Skipping.')
         return False
     profile['local'] = local
 
@@ -107,18 +107,19 @@ def lint_profile(name, profile, bad_regexes):
 def filter_superseded(profiles):
     """filter out profiles whose local path is child of some other profile's local path"""
     childs = set()
-    for name, profile in profiles.items():
-        for name2, profile2 in profiles.items():
+    for profile in profiles:
+        name = profile['name']
+        for profile2 in profiles:
+            name2 = profile2['name']
             if name == name2 or name in childs or name2 in childs:
                 continue
             if profile['local'].startswith(profile2['local']):
-                child = name2 if len(profile2['local']) > len(profile['local']) else name
-                parent = name if child == name2 else name2
-                print(f"Warning: {profiles[child]['name']} {profiles[child]['local']} "
-                      f"is superceded by {profiles[parent]['name']} {profiles[parent]['local']}. Skipping.")
-                childs.add(child)
-    return profiles if not childs else {name: profile for name, profile in profiles.items()
-                                        if name not in childs}
+                child = profile2 if len(profile2['local']) > len(profile['local']) else profile
+                parent = profile if child == profile2 else profile2
+                print(f"Warning: {child['name']} {child['local']} "
+                      f"is superceded by {parent['name']} {parent['local']}. Skipping.")
+                childs.add(child['name'])
+    return profiles if not childs else [p for p in profiles if p['name'] not in childs]
 
 
 def load_config(file_path, argv):
@@ -126,7 +127,7 @@ def load_config(file_path, argv):
     Args:
         file_path: The path to the INI file.
         argv: list of profiles from command line
-    Returns: dict of valid, wqnted profiles
+    Returns: list of valid, wqnted profiles
     Note: if ENCRYPT_PASSWORD: if True,
         change password=<value> to pwd=<encrypted value>
         and rewrite the ini file
@@ -162,8 +163,7 @@ def load_config(file_path, argv):
     config.walk(gather_profiles, call_on_sections=True, take=take, profiles=profiles)
 
     bad_regexes = set()
-    profiles = {name: profile for name, profile in profiles.items()
-                if lint_profile(name, profile, bad_regexes)}
+    profiles = [profile for profile in profiles.values() if lint_profile(profile, bad_regexes)]
     profiles = filter_superseded(profiles)
 
     print()

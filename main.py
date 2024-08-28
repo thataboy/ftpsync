@@ -494,7 +494,7 @@ class SyncManager:
 def start_monitor(profiles):
     sync_managers = []
 
-    for profile in profiles.values():
+    for profile in profiles:
         sync_manager = SyncManager(profile)
         try:
             sync_manager.start()
@@ -525,21 +525,24 @@ def get_files_to_sync(local_folder, modified_since, ignore_regex):
 
 
 def manual_sync(profiles, modified_since, execute=False):
-    for profile in profiles.values():
+    for profile in profiles:
+        print()
+        name = profile['name']
+
         files_to_sync = get_files_to_sync(profile['local'], modified_since, profile['ignore_regex'])
 
         if not files_to_sync:
-            print(f"{profile['name']}: Nothing to sync.")
+            print(f"{name}: Nothing to sync.")
             continue
 
         if not execute:
-            print(f"Preview for {profile['name']}:")
+            print(f"Preview for {name}:")
             for file in files_to_sync:
                 print(f"  {colorize_path(file, profile['local'])}")
             continue
 
         sync_manager = SyncManager(profile)
-        logger.info(f"Syncing profile {profile['name']}: {profile['local']} -> {profile['remote']}")
+        logger.info(f"Syncing profile {name}: {profile['local']} -> {profile['remote']}")
         for file_path in files_to_sync:
             sync_manager.queue.put(FileOperation('upload', file_path, batch_id=1))
 
@@ -547,7 +550,6 @@ def manual_sync(profiles, modified_since, execute=False):
         sync_manager.queue.join()  # Wait for all tasks to be processed
         sync_manager.queue_handler.stop()
         sync_manager.ftps_handler.disconnect()
-        print()
 
 
 def monitor_profiles(profiles):
