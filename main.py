@@ -127,9 +127,9 @@ class FileMonitorHandler(FileSystemEventHandler):
             # check for file modified event right after file created event
             # to avoid duplicate uploads. This seems to happen when
             # user duplicates file(s) in Finder
-            if self.last_operation_time and \
-               self.last_operation != 'upload' and \
-               self.last_operation_src != event.src_path and \
+            if self.last_operation_time is None or \
+               self.last_operation != 'upload' or \
+               self.last_operation_src != event.src_path or \
                time.time() - self.last_operation_time > self.micro_time_threshold:
                 self.queue_operation('upload', event.src_path)
 
